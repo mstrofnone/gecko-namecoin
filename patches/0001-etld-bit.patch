@@ -1,0 +1,50 @@
+From: Namecoin Integration <namecoin-integration@example.com>
+Date: 2026-04-16
+Subject: [PATCH 1/4] netwerk/dns: Add .bit to effective_tld_names.dat
+
+Adds "bit" to the Public Suffix List so Firefox treats .bit as a proper
+effective TLD. Without this, Firefox would treat "example.bit" as having
+an eTLD of "bit" but share cookies/origins across all .bit domains.
+
+This ensures:
+  - Proper origin isolation: example.bit ≠ other.bit
+  - Cookie scope respects .bit boundaries
+  - SameSite cookie attributes work correctly for .bit domains
+  - Prevents cross-.bit domain tracking via shared storage
+
+The entry is placed in the "ICANN DOMAINS" section near the end of the
+TLD list, with a comment referencing the Namecoin feature flag to help
+maintainers when the PSL is updated upstream.
+
+Ongoing maintenance note: When effective_tld_names.dat is updated from
+the upstream Public Suffix List (PSL), this entry must be re-added.
+A comment marker "NAMECOIN_INTEGRATION" is included to make grep-based
+detection easy in automated rebase scripts.
+
+Bug: <to be filed on bugzilla.mozilla.org>
+Reviewed-by: <pending>
+
+---
+ netwerk/dns/effective_tld_names.dat | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/netwerk/dns/effective_tld_names.dat b/netwerk/dns/effective_tld_names.dat
+index a1b2c3d4..e5f6a7b8 100644
+--- a/netwerk/dns/effective_tld_names.dat
++++ b/netwerk/dns/effective_tld_names.dat
+@@ -12000,6 +12000,14 @@ aw
+ // Amazon : https://www.amazon.com/
+ z-1.a9.com
+ 
++// BEGIN NAMECOIN_INTEGRATION
++// Namecoin decentralized DNS (.bit TLD)
++// See: https://namecoin.org/
++// Feature flag: network.namecoin.enabled (about:config)
++// Ensures proper origin isolation for .bit domains.
++// Must be preserved when updating this file from the upstream PSL.
++bit
++// END NAMECOIN_INTEGRATION
++
+ // === END ICANN DOMAINS ===
+ 
+ // === BEGIN PRIVATE DOMAINS ===

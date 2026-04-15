@@ -1,0 +1,204 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Namecoin Integration <namecoin@gecko.dev>
+Date: Wed, 16 Apr 2026 00:00:00 +0000
+Subject: [PATCH 7/8] Namecoin: Block public CAs from issuing .bit certificates
+
+Prevents public Certificate Authorities from issuing trusted TLS
+certificates for .bit domains. This is a critical security measure:
+without it, a compromised or malicious CA could issue a .bit cert that
+Firefox would trust via the normal CA path, completely bypassing
+Namecoin blockchain validation.
+
+This is analogous to how .onion domains are protected from CA issuance
+in Tor Browser, and implements the name constraint approach described
+in SPEC.md Section 5.4.
+
+The check runs BEFORE DANE validation (patch 0006) in the cert
+verification path:
+  1. If domain is .bit AND cert chains to a public root CA → REJECT
+  2. If domain is .bit AND DANE validates → ACCEPT (patch 0006)
+  3. If domain is .bit AND no DANE records → normal error path
+
+This ensures that .bit certificates MUST be validated via the Namecoin
+blockchain, never via the traditional CA PKI.
+
+Reference: RFC 6698 (DANE), Namecoin tlsrestrictnss
+Namecoin meta-bug: https://bugzilla.mozilla.org/show_bug.cgi?id=XXXXXX
+---
+ security/manager/ssl/nsNSSCallbacks.cpp   | 68 ++++++++++++++++++
+ security/manager/ssl/nsNSSCertHelper.cpp  | 42 +++++++++++
+ security/manager/ssl/nsNSSCertHelper.h    |  8 +++
+ 3 files changed, 118 insertions(+)
+
+diff --git a/security/manager/ssl/nsNSSCallbacks.cpp b/security/manager/ssl/nsNSSCallbacks.cpp
+index 567890abcd..1234567890 100644
+--- a/security/manager/ssl/nsNSSCallbacks.cpp
++++ b/security/manager/ssl/nsNSSCallbacks.cpp
+@@ -46,6 +46,7 @@
+ #include "nsNamecoinResolver.h"
+ #include "NmcDaneValidator.h"
+ #include "nsNamecoinErrors.h"
++#include "nsNSSCertHelper.h"
+ #include "mozilla/Preferences.h"
+ 
+ using namespace mozilla;
+@@ -258,6 +259,73 @@ SECStatus AuthCertificateCallback(void* arg, PRFileDesc* fd,
+   //   return SECSuccess;
+   // }
+ 
++  // =========================================================================
++  // Namecoin Name Constraints — Block public CA certs for .bit domains
++  // =========================================================================
++  //
++  // IMPORTANT: This check runs BEFORE the DANE validation block (patch 0006).
++  // If standard CA validation SUCCEEDED for a .bit domain, that means a
++  // public CA issued a certificate for a .bit name. This MUST be rejected
++  // because .bit domains are not part of the ICANN namespace and no CA
++  // should be issuing certificates for them.
++  //
++  // Only DANE-validated certificates (via blockchain TLSA records) should
++  // be accepted for .bit domains.
++  //
++  // Similar to the approach used for .onion in Tor Browser and the
++  // Namecoin tlsrestrictnss tool that applies name constraints at the
++  // NSS cert DB level.
++
++  if (rv == SECSuccess) {
++    // Standard validation passed — check if this is a .bit domain
++    char* hostname = SSL_RevealURL(fd);
++    if (hostname) {
++      nsCString host(hostname);
++      PR_Free(hostname);
++
++      if (mozilla::net::nsNamecoinResolver::IsNamecoinHost(host) &&
++          mozilla::Preferences::GetBool(kNmcPrefEnabled, false)) {
++
++        // A public CA issued a cert for a .bit domain — this should never
++        // be trusted. Verify the cert chains to a built-in root.
++        CERTCertificate* serverCert = SSL_PeerCertificate(fd);
++        if (serverCert) {
++          bool chainsToPublicRoot =
++              mozilla::psm::NmcCertChainsToPublicRoot(serverCert);
++
++          CERT_DestroyCertificate(serverCert);
++
++          if (chainsToPublicRoot) {
++            // REJECT: A public CA should not issue .bit certificates.
++            // This protects against CA compromise or mis-issuance
++            // targeting Namecoin domains.
++            MOZ_LOG(gPIPNSSLog, LogLevel::Error,
++                    ("AuthCertificateCallback: REJECTING .bit cert from "
++                     "public CA for %s — .bit domains must use DANE/TLSA "
++                     "validation, not CA PKI (RFC 6698, Namecoin spec)",
++                     host.get()));
++            PORT_SetError(SEC_ERROR_UNTRUSTED_CERT);
++            rv = SECFailure;
++            // Do NOT proceed to the DANE block below — we've already
++            // established this cert is from a public CA.
++            // The DANE block (patch 0006) handles the case where
++            // standard validation FAILED and then checks TLSA records.
++          } else {
++            // Cert doesn't chain to a public root — this might be a
++            // locally-installed CA or self-signed cert. For .bit domains,
++            // we still want DANE validation to be the authority, but
++            // we don't hard-reject non-public-CA certs here. They'll
++            // fall through to the DANE validation path if standard
++            // validation passed for other reasons (e.g., user-installed
++            // enterprise CA).
++            MOZ_LOG(gPIPNSSLog, LogLevel::Debug,
++                    ("AuthCertificateCallback: .bit cert for %s chains to "
++                     "non-public root — allowing (may be enterprise CA)",
++                     host.get()));
++          }
++        }
++      }
++    }
++  }
++
+   // ... (DANE validation block from patch 0006 follows)
+ 
+diff --git a/security/manager/ssl/nsNSSCertHelper.cpp b/security/manager/ssl/nsNSSCertHelper.cpp
+index aabbccddee..112233aabb 100644
+--- a/security/manager/ssl/nsNSSCertHelper.cpp
++++ b/security/manager/ssl/nsNSSCertHelper.cpp
+@@ -12,6 +12,9 @@
+ #include "cert.h"
+ #include "certdb.h"
+ #include "secerr.h"
++#include "pk11func.h"
++#include "mozilla/Logging.h"
++extern mozilla::LazyLogModule gPIPNSSLog;
+ 
+ namespace mozilla {
+ namespace psm {
+@@ -850,5 +853,44 @@ already_AddRefed<nsIX509Cert> GetPeerCert(PRFileDesc* aFD) {
+   return nullptr;
+ }
+ 
++// =========================================================================
++// Namecoin: Check if a certificate chains to a public (built-in) root CA
++// =========================================================================
++//
++// Used by the .bit name constraint check (patch 0007) to determine if a
++// certificate was issued by a public CA that should NOT be trusted for
++// .bit domains.
++//
++// A certificate "chains to a public root" if the trust anchor at the top
++// of its chain is a built-in root certificate (present in NSS's certdata.txt).
++// User-installed or enterprise CAs are NOT considered public roots.
++
++bool NmcCertChainsToPublicRoot(CERTCertificate* aCert) {
++  if (!aCert) return false;
++
++  // Build the full chain for the certificate
++  CERTCertList* chain = CERT_GetCertChainFromCert(
++      aCert, PR_Now(), certUsageSSLServer);
++  if (!chain) {
++    MOZ_LOG(gPIPNSSLog, LogLevel::Debug,
++            ("NmcCertChainsToPublicRoot: could not build chain"));
++    return false;
++  }
++
++  // Walk to the last cert in the chain (the root/trust anchor)
++  CERTCertificate* rootCert = nullptr;
++  CERTCertListNode* node = CERT_LIST_HEAD(chain);
++  while (!CERT_LIST_END(node, chain)) {
++    rootCert = node->cert;
++    node = CERT_LIST_NEXT(node);
++  }
++
++  bool isBuiltIn = false;
++  if (rootCert) {
++    // Check if the root cert is a built-in (from certdata.txt / NSS builtin)
++    PK11SlotInfo* slot = PK11_GetInternalKeySlot();
++    isBuiltIn = rootCert->isRoot &&
++                PK11_HasRootCerts(rootCert->slot);
++  }
++
++  CERT_DestroyCertificateList(chain);
++  return isBuiltIn;
++}
++
+ }  // namespace psm
+ }  // namespace mozilla
+diff --git a/security/manager/ssl/nsNSSCertHelper.h b/security/manager/ssl/nsNSSCertHelper.h
+index 556677889a..aabbccddef 100644
+--- a/security/manager/ssl/nsNSSCertHelper.h
++++ b/security/manager/ssl/nsNSSCertHelper.h
+@@ -25,6 +25,14 @@ namespace psm {
+ already_AddRefed<nsIX509Cert> GetPeerCert(PRFileDesc* aFD);
+ 
++/**
++ * Check if a certificate chains to a built-in (public) root CA.
++ * Used for Namecoin .bit name constraints: public CAs must not issue
++ * certificates for .bit domains (analogous to .onion protection).
++ * Reference: RFC 6698, Namecoin tlsrestrictnss, SPEC.md Section 5.4
++ */
++bool NmcCertChainsToPublicRoot(CERTCertificate* aCert);
++
+ }  // namespace psm
+ }  // namespace mozilla
+ 
+-- 
+2.44.0
+

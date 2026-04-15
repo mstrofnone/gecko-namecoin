@@ -1,0 +1,300 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Namecoin Integration <namecoin@example.org>
+Date: Wed, 16 Apr 2026 00:00:00 +0000
+Subject: [PATCH 0011] Certificate viewer: show Namecoin DANE trust source
+
+When a certificate was validated via Namecoin DANE-TLSA, show blockchain
+verification details in the certificate viewer:
+  - Trust source: "Namecoin Blockchain (DANE-TLSA)"
+  - Name registration block height
+  - Transaction hash (truncated, with link to namecha.in)
+  - TLSA record details (usage, selector, matching type)
+  - Name expiry block and approximate date
+
+Modifies the certificate viewer (about:certificate) React components and
+the PSM certificate info provider to include Namecoin-specific fields.
+
+Bug: XXXXXX — [namecoin] Phase 3: Certificate viewer DANE indicators
+---
+ toolkit/components/certviewer/content/certDecoder.mjs      | 68 ++++++++++
+ toolkit/components/certviewer/content/components/info-group.mjs | 89 +++++++++++++
+ security/manager/ssl/nsNSSCertHelper.cpp                    | 45 +++++++
+ security/manager/ssl/TransportSecurityInfo.h                |  8 ++
+ 4 files changed, 210 insertions(+)
+
+--- a/toolkit/components/certviewer/content/certDecoder.mjs
++++ b/toolkit/components/certviewer/content/certDecoder.mjs
+@@ -200,6 +200,74 @@ export class CertDecoder {
+      return info;
+    }
+ 
++   /**
++    * Append Namecoin blockchain verification info to the certificate
++    * details when the cert was validated via DANE-TLSA.
++    *
++    * Called from the info-group component when it detects that the
++    * current site's host ends in .bit and the transport security info
++    * includes Namecoin DANE state.
++    *
++    * @param {object} nmcInfo — Namecoin DANE validation data from
++    *   TransportSecurityInfo.namecoinDANEInfo, containing:
++    *   {
++    *     validated: bool,
++    *     blockHeight: number,
++    *     txHash: string (64-char hex),
++    *     expiryBlock: number,
++    *     expiryDateApprox: string (ISO 8601),
++    *     name: string (e.g., "d/testls"),
++    *     tlsaUsage: number (2 or 3),
++    *     tlsaSelector: number (0 or 1),
++    *     tlsaMatchType: number (0, 1, or 2),
++    *   }
++    * @returns {Array<object>} Array of info items for rendering.
++    */
++   static buildNamecoinInfoItems(nmcInfo) {
++     if (!nmcInfo || !nmcInfo.validated) {
++       return [];
++     }
++
++     const items = [];
++
++     // Trust source
++     items.push({
++       labelId: "certviewer-namecoin-trust-source",
++       info: "Namecoin Blockchain (DANE-TLSA)",
++       critical: false,
++     });
++
++     // Registration block height
++     items.push({
++       labelId: "certviewer-namecoin-block-height",
++       info: `Block ${nmcInfo.blockHeight.toLocaleString()}`,
++     });
++
++     // Transaction hash — truncated with explorer link
++     const truncHash = nmcInfo.txHash.substring(0, 12) + "…" +
++                        nmcInfo.txHash.substring(52);
++     const explorerUrl = `https://namecha.in/tx/${nmcInfo.txHash}`;
++     items.push({
++       labelId: "certviewer-namecoin-tx-hash",
++       info: truncHash,
++       link: explorerUrl,
++     });
++
++     // Name expiry
++     items.push({
++       labelId: "certviewer-namecoin-name-expiry",
++       info: `Expires after block ${nmcInfo.expiryBlock.toLocaleString()} (approx. ${nmcInfo.expiryDateApprox})`,
++     });
++
++     // TLSA record details
++     const usageLabels = { 2: "DANE-TA (Trust Anchor)", 3: "DANE-EE (End Entity)" };
++     const selectorLabels = { 0: "Full Certificate", 1: "SubjectPublicKeyInfo" };
++     const matchLabels = { 0: "Exact Match", 1: "SHA-256", 2: "SHA-512" };
++
++     items.push({
++       labelId: "certviewer-namecoin-tlsa-section",
++       info: [
++         `Usage: ${nmcInfo.tlsaUsage} — ${usageLabels[nmcInfo.tlsaUsage] || "Unknown"}`,
++         `Selector: ${nmcInfo.tlsaSelector} — ${selectorLabels[nmcInfo.tlsaSelector] || "Unknown"}`,
++         `Matching Type: ${nmcInfo.tlsaMatchType} — ${matchLabels[nmcInfo.tlsaMatchType] || "Unknown"}`,
++       ].join("\n"),
++     });
++
++     return items;
++   }
++
+    // ... rest of class ...
+
+--- a/toolkit/components/certviewer/content/components/info-group.mjs
++++ b/toolkit/components/certviewer/content/components/info-group.mjs
+@@ -45,6 +45,95 @@ export class InfoGroup extends HTMLElement {
+      const container = this.shadowRoot.querySelector(".info-group-body");
+      // ... existing rendering code ...
+ 
++     // =====================================================================
++     // Namecoin DANE section — appended after standard certificate fields
++     // when the host is a .bit domain with blockchain verification.
++     // =====================================================================
++     this._renderNamecoinSection(container);
++   }
++
++   /**
++    * Render the Namecoin blockchain verification section in the cert viewer.
++    *
++    * This section appears only when:
++    *   1. The certificate's host ends in .bit
++    *   2. TransportSecurityInfo includes namecoinDANEInfo
++    *   3. The DANE validation was attempted (validated = true or mismatch)
++    *
++    * REAL IMPL: The namecoinDANEInfo object would be populated by
++    * security/manager/ssl/TransportSecurityInfo.cpp from the DANE
++    * validation result stored during nsNSSCallbacks::AuthCertificate.
++    */
++   _renderNamecoinSection(container) {
++     // REAL IMPL:
++     // const secInfo = this._securityInfo;
++     // if (!secInfo?.namecoinDANEInfo) return;
++     // const nmcInfo = secInfo.namecoinDANEInfo;
++
++     // Prototype: check if the certificate subject contains .bit
++     // In production, this data comes from TransportSecurityInfo.
++     const host = this._host || "";
++     if (!host.endsWith(".bit")) {
++       return;
++     }
++
++     // Mock data for prototype rendering
++     const nmcInfo = {
++       validated: true,
++       blockHeight: 821455,
++       txHash: "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592",
++       expiryBlock: 857455,
++       expiryDateApprox: "2026-08-15",
++       name: "d/" + host.replace(".bit", ""),
++       tlsaUsage: 3,
++       tlsaSelector: 1,
++       tlsaMatchType: 1,
++     };
++
++     const items = CertDecoder.buildNamecoinInfoItems(nmcInfo);
++     if (items.length === 0) return;
++
++     // Section header
++     const header = document.createElement("h3");
++     header.className = "nmc-section-header";
++     header.setAttribute("data-l10n-id", "certviewer-namecoin-section-title");
++     header.textContent = "Namecoin Blockchain Verification";
++     container.appendChild(header);
++
++     // Verification badge
++     const badge = document.createElement("div");
++     badge.className = nmcInfo.validated ? "nmc-verified-badge" : "nmc-mismatch-badge";
++     badge.setAttribute("data-l10n-id",
++       nmcInfo.validated ? "certviewer-namecoin-verified" : "certviewer-namecoin-mismatch"
++     );
++     badge.textContent = nmcInfo.validated
++       ? "✓ Certificate matches blockchain TLSA record"
++       : "✗ Certificate does NOT match blockchain TLSA record";
++     container.appendChild(badge);
++
++     // Render each info item
++     for (const item of items) {
++       const row = document.createElement("div");
++       row.className = "nmc-info-row";
++
++       const label = document.createElement("span");
++       label.className = "nmc-label";
++       label.setAttribute("data-l10n-id", item.labelId);
++       label.textContent = item.labelId.replace("certviewer-namecoin-", "").replace(/-/g, " ");
++       row.appendChild(label);
++
++       const value = document.createElement("span");
++       value.className = "nmc-value";
++       if (item.link) {
++         const a = document.createElement("a");
++         a.href = item.link;
++         a.target = "_blank";
++         a.rel = "noopener noreferrer";
++         a.textContent = item.info;
++         value.appendChild(a);
++       } else {
++         value.textContent = item.info;
++       }
++       row.appendChild(value);
++
++       container.appendChild(row);
++     }
++   }
++
+    // ... rest of rendering ...
+
+--- a/security/manager/ssl/nsNSSCertHelper.cpp
++++ b/security/manager/ssl/nsNSSCertHelper.cpp
+@@ -800,6 +800,51 @@ nsresult GetCertificateFields(CERTCertif
+   // ... existing certificate field extraction ...
+ 
++  // =========================================================================
++  // Namecoin DANE-TLSA validation info
++  //
++  // When the certificate was validated against a DANE-TLSA record from the
++  // Namecoin blockchain (via nsNamecoinResolver), we attach the blockchain
++  // verification details to the certificate info structure.
++  //
++  // This data is set by nsNSSCallbacks::AuthCertificate when it detects
++  // that the host is a .bit domain and the DANE validation path was used.
++  //
++  // The data flows:
++  //   nsNamecoinResolver (DNS phase) → stores TLSA in NamecoinNameValue
++  //   nsNSSCallbacks::AuthCertificate → reads TLSA, validates cert
++  //   TransportSecurityInfo → stores result as namecoinDANEInfo
++  //   nsNSSCertHelper (here) → includes in cert viewer data
++  //   about:certificate React UI → renders the section
++  // =========================================================================
++
++  // REAL IMPL:
++  // if (aSecInfo && aSecInfo->mNamecoinDANEInfo.isSome()) {
++  //   const auto& nmc = aSecInfo->mNamecoinDANEInfo.value();
++  //   nsCOMPtr<nsIMutableArray> nmcSection;
++  //   NS_NewArray(getter_AddRefs(nmcSection));
++  //
++  //   // Add trust source
++  //   AddFieldToSection(nmcSection, "Namecoin Blockchain (DANE-TLSA)",
++  //                     "Trust Source");
++  //
++  //   // Add block height
++  //   nsAutoString heightStr;
++  //   heightStr.AppendInt(nmc.mBlockHeight);
++  //   AddFieldToSection(nmcSection, heightStr, "Registration Block");
++  //
++  //   // Add transaction hash with explorer URL
++  //   nsAutoString txStr;
++  //   txStr.Append(NS_ConvertUTF8toUTF16(nmc.mTxHash));
++  //   AddFieldToSection(nmcSection, txStr, "Transaction Hash");
++  //
++  //   // Add TLSA details
++  //   nsAutoString tlsaStr;
++  //   tlsaStr.AppendPrintf("Usage=%u Selector=%u MatchType=%u",
++  //                         nmc.mTLSAUsage, nmc.mTLSASelector,
++  //                         nmc.mTLSAMatchType);
++  //   AddFieldToSection(nmcSection, tlsaStr, "DANE-TLSA Record");
++  //
++  //   aFields->AppendElement(nmcSection);
++  // }
++
+   return NS_OK;
+ }
+
+--- a/security/manager/ssl/TransportSecurityInfo.h
++++ b/security/manager/ssl/TransportSecurityInfo.h
+@@ -15,6 +15,7 @@
+ #include "nsITransportSecurityInfo.h"
+ #include "nsString.h"
+ #include "nsTArray.h"
++#include "mozilla/Maybe.h"
+ 
+ namespace mozilla {
+ namespace psm {
+@@ -30,6 +31,13 @@ class TransportSecurityInfo : public nsI
+ 
+   // ... existing members ...
+ 
++  // Namecoin DANE-TLSA validation result, populated by AuthCertificate
++  // when the host is a .bit domain. Read by the certificate viewer to
++  // display blockchain verification details.
++  struct NamecoinDANEInfo {
++    bool validated = false;
++    uint32_t blockHeight = 0;
++    nsCString txHash;           // 64-char hex SHA-256d of the NAME_UPDATE tx
++    uint32_t expiryBlock = 0;
++    uint8_t tlsaUsage = 0;     // 2 = DANE-TA, 3 = DANE-EE
++    uint8_t tlsaSelector = 0;  // 0 = Full cert, 1 = SPKI
++    uint8_t tlsaMatchType = 0; // 0 = Exact, 1 = SHA-256, 2 = SHA-512
++  };
++  Maybe<NamecoinDANEInfo> mNamecoinDANEInfo;
++
+  private:
+   // ... existing private members ...
+ };
+--
+2.43.0

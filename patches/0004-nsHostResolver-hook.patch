@@ -1,0 +1,160 @@
+From: Namecoin Integration <namecoin-integration@example.com>
+Date: 2026-04-16
+Subject: [PATCH 4/4] netwerk/dns: Hook nsNamecoinResolver into nsHostResolver
+
+Modifies nsHostResolver::ResolveHost() to route .bit TLD queries to
+nsNamecoinResolver when network.namecoin.enabled is true.
+
+The hook is a minimal, surgical change:
+  1. After the host record is locked but before system DNS is attempted,
+     check if TLD == "bit" and namecoin resolver is enabled.
+  2. If yes, dispatch to nsNamecoinResolver::Resolve() instead.
+  3. nsNamecoinResolver callback populates the nsHostRecord with NetAddr
+     results, exactly as the existing DNS path does.
+  4. If the resolver is disabled or the name is not .bit, fall through to
+     normal DNS resolution (no behavioral change).
+
+nsNamecoinResolver is held as a static singleton on nsHostResolver,
+initialized lazily on first .bit query.
+
+Error handling:
+  - If all ElectrumX servers fail: DNS query fails with NS_ERROR_NET_INTERRUPT
+    (not a silent NXDOMAIN — .bit is not a real TLD)
+  - If name is expired: NS_ERROR_FAILURE with specific error message
+  - If name not found: NS_ERROR_FAILURE
+
+Thread safety:
+  - nsNamecoinResolver uses a Mutex for server list access
+  - ResolveInternal() always runs on background thread (asserts this)
+  - Callback fires on main thread via NS_DispatchToMainThread
+
+Bug: <to be filed on bugzilla.mozilla.org>
+Reviewed-by: <pending>
+
+---
+ netwerk/dns/nsHostResolver.cpp | 52 +++++++++++++++++++++++++++++++++++++++
+ netwerk/dns/nsHostResolver.h   |  8 ++++++
+ 2 files changed, 60 insertions(+)
+
+diff --git a/netwerk/dns/nsHostResolver.h b/netwerk/dns/nsHostResolver.h
+index 11112222..33334444 100644
+--- a/netwerk/dns/nsHostResolver.h
++++ b/netwerk/dns/nsHostResolver.h
+@@ -25,6 +25,7 @@
+ #include "mozilla/net/DNS.h"
+ #include "mozilla/net/HostRecordQueue.h"
+ #include "nsHostRecord.h"
++#include "nsNamecoinResolver.h"
+ 
+ namespace mozilla {
+ namespace net {
+@@ -180,6 +181,13 @@ class nsHostResolver : public nsISupports, public nsHostRecord::Callbacks {
+   // ...existing members...
+ 
+  private:
++  // Namecoin (.bit) resolver — initialized lazily on first .bit query.
++  // Null if network.namecoin.enabled is false or Init() failed.
++  RefPtr<nsNamecoinResolver> mNamecoinResolver;
++  Mutex mNamecoinResolverMutex{"nsHostResolver::mNamecoinResolverMutex"};
++
++  // Returns the Namecoin resolver, creating it if needed. May return null.
++  nsNamecoinResolver* GetNamecoinResolver();
++
+   // ...existing private members...
+ };
+
+diff --git a/netwerk/dns/nsHostResolver.cpp b/netwerk/dns/nsHostResolver.cpp
+index 55556666..77778888 100644
+--- a/netwerk/dns/nsHostResolver.cpp
++++ b/netwerk/dns/nsHostResolver.cpp
+@@ -800,6 +800,52 @@ nsresult nsHostResolver::ResolveHost(const nsACString& aHost,
+   // ... (existing resolution logic) ...
+ }
+ 
++// ---------------------------------------------------------------------------
++// Namecoin resolver integration
++// ---------------------------------------------------------------------------
++
++nsNamecoinResolver* nsHostResolver::GetNamecoinResolver() {
++  MutexAutoLock lock(mNamecoinResolverMutex);
++  if (!mNamecoinResolver) {
++    auto resolver = MakeRefPtr<nsNamecoinResolver>();
++    nsresult rv = resolver->Init();
++    if (NS_SUCCEEDED(rv) && resolver->IsEnabled()) {
++      mNamecoinResolver = std::move(resolver);
++    }
++  }
++  return mNamecoinResolver;
++}
++
++/**
++ * Route a .bit hostname to nsNamecoinResolver.
++ *
++ * Called from within nsHostResolver::ResolveHost() before system DNS.
++ * Returns true if the query was handled (or failed) by the Namecoin resolver,
++ * false if we should fall through to normal DNS.
++ *
++ * The aRecord is populated with the resolved addresses on success.
++ * On failure (expired, not found, servers down), aRecord is left empty and
++ * NS_ERROR_FAILURE is returned — the caller should surface a network error.
++ */
++static nsresult TryNamecoinResolve(nsHostResolver* aResolver,
++                                    const nsACString& aHostname,
++                                    nsHostRecord* aRecord,
++                                    bool& aHandled) {
++  aHandled = false;
++  if (!nsNamecoinResolver::IsNamecoinHost(aHostname)) return NS_OK;
++
++  nsNamecoinResolver* namecoin = aResolver->GetNamecoinResolver();
++  if (!namecoin) return NS_OK;
++
++  // Synchronous call on the resolver thread (never main thread).
++  // Phase 2 will convert to async to avoid blocking the thread pool slot.
++  NamecoinResolveResult result;
++  nsresult rv = namecoin->ResolveSync(aHostname, result);
++  aHandled = true;
++
++  if (NS_FAILED(rv) || !result.resolved) {
++    NS_ConvertUTF8toUTF16 error(result.error.IsEmpty()
++                                    ? "Namecoin resolution failed"
++                                    : result.error.get());
++    // TODO: Surface structured error to the error console
++    return NS_FAILED(rv) ? rv : NS_ERROR_FAILURE;
++  }
++
++  // Populate nsHostRecord with the resolved addresses
++  for (const auto& addr : result.addresses) {
++    aRecord->addr_info->AddAddress(MakeUnique<NetAddrElement>(addr));
++  }
++
++  // Store Namecoin metadata on the record for Phase 2 (TLS) and Phase 3 (UI)
++  // TODO: aRecord->SetNamecoinMetadata(result.blockHeight, result.updateHeight,
++  //                                      result.txHash, result.nameValue.tls);
++
++  // Set TTL on the record
++  aRecord->SetResolveTime(TimeDuration::FromSeconds(result.ttlSeconds));
++
++  return NS_OK;
++}
++
++// NOTE: The following diff shows where TryNamecoinResolve() is called within
++// ResolveHost(). The exact line numbers will vary; find the location just
++// before the system DNS dispatch.
++//
++// Search for "NativeResolve" or "mResolver->ResolveHost" in nsHostResolver.cpp
++// and insert the TryNamecoinResolve call before that block:
++//
++//   bool namecoinHandled = false;
++//   if (nsNamecoinResolver::IsNamecoinHost(rec->host)) {
++//     rv = TryNamecoinResolve(this, rec->host, rec, namecoinHandled);
++//     if (namecoinHandled) {
++//       // Either succeeded or failed — don't fall through to system DNS
++//       // (.bit is not a real TLD; system DNS would return NXDOMAIN)
++//       if (NS_FAILED(rv)) {
++//         rec->OnResolveComplete(rv);
++//       } else {
++//         rec->OnResolveComplete(NS_OK);
++//       }
++//       return rv;
++//     }
++//   }

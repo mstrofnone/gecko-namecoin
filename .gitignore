@@ -1,0 +1,38 @@
+# OpenClaw workspace files — not part of gecko-namecoin project
+AGENTS.md
+SOUL.md
+IDENTITY.md
+USER.md
+TOOLS.md
+HEARTBEAT.md
+BOOTSTRAP.md
+MEMORY.md
+memory/
+.openclaw/
+.DS_Store
+
+# Research / session notes from other projects in this workspace
+browser.txt
+electrumx.txt
+namecoin.txt
+howto-bit-website.txt
+extension.txt
+extension1.txt
+extension2.txt
+extension3.txt
+extension4.txt
+extension5.txt
+extension6.txt
+extension7.txt
+extension8.txt
+extension9.txt
+extension10.txt
+
+# Safari extension (separate project)
+TLS Namecoin Resolver/
+
+# Firefox WebExtension (separate project — reference implementation)
+tls-namecoin-ext/
+
+# Accidental gecko-namecoin subdirectory (files live at repo root, not here)
+gecko-namecoin/

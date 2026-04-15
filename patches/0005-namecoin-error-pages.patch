@@ -1,0 +1,161 @@
+# HG changeset patch
+# User Namecoin Gecko Integration <nicola@example.com>
+# Date 0 0
+# Node ID 0000000000000000000000000000000000000005
+# Parent  0000000000000000000000000000000000000004
+
+Bug XXXXXX - Namecoin: custom error pages for .bit resolution failures r=necko-reviewers
+
+Wire Namecoin-specific error codes into Gecko's error page system so that
+.bit resolution failures show informative messages instead of the generic
+"Server not found" page.
+
+This patch covers:
+  1. Error code registration in nsNetErrorCodes.h (module 77)
+  2. Error page rendering hooks in netError.xhtml
+  3. Fluent localization strings in netError-namecoin.ftl
+
+The actual error codes are defined in netwerk/dns/nsNamecoinErrors.h
+(added by patch 0003). The nsNamecoinResolver.cpp returns these codes
+from ResolveInternal() based on the specific failure mode.
+
+NOTE: This is a template/guide patch. The exact line numbers will vary
+depending on the mozilla-central revision being patched against. The
+sections below show the insertion points and surrounding context.
+
+diff --git a/netwerk/base/nsNetErrorCodes.h b/netwerk/base/nsNetErrorCodes.h
+--- a/netwerk/base/nsNetErrorCodes.h
++++ b/netwerk/base/nsNetErrorCodes.h
+@@ -XXX,6 +XXX,28 @@
+  *   NS_ERROR_GENERATE_FAILURE(NS_ERROR_MODULE_NETWORK, <code>)
+  */
+ 
++// =========================================================================
++// Namecoin (.bit) resolution errors — Module 77
++// =========================================================================
++//
++// These codes are defined in netwerk/dns/nsNamecoinErrors.h and returned
++// by nsNamecoinResolver::ResolveInternal(). They are listed here so that
++// the docshell error page machinery (netError.xhtml) can map them to
++// user-facing strings.
++//
++// To use: #include "nsNamecoinErrors.h" in the consuming translation unit.
++// The codes are:
++//
++//   NS_ERROR_NAMECOIN_NOT_FOUND           = 0x804D0001
++//     Name has no history on the Namecoin blockchain.
++//
++//   NS_ERROR_NAMECOIN_EXPIRED             = 0x804D0002
++//     Name's last update is >36,000 blocks old.
++//
++//   NS_ERROR_NAMECOIN_SERVERS_UNREACHABLE = 0x804D0003
++//     All configured ElectrumX servers failed.
++//
++//   NS_ERROR_NAMECOIN_NO_ADDRESS          = 0x804D0004
++//     Name exists but value JSON has no IP/NS/translate fields.
++
+ // =========================================================================
+ // Existing network error codes continue below...
+ // =========================================================================
+
+diff --git a/docshell/resources/content/netError.xhtml b/docshell/resources/content/netError.xhtml
+--- a/docshell/resources/content/netError.xhtml
++++ b/docshell/resources/content/netError.xhtml
+@@ -XXX,6 +XXX,12 @@
+      <!-- Add Namecoin .ftl to the list of localization resources -->
+      <link rel="localization" href="toolkit/neterror/netError.ftl"/>
++     <link rel="localization" href="toolkit/neterror/netError-namecoin.ftl"/>
+
+@@ -XXX,6 +XXX,50 @@
+      // Inside the initPage() function or equivalent error-code switch,
+      // add cases for Namecoin error codes.
+      //
+      // The error code string is passed via the "e" URL parameter in
+      // about:neterror?e=<errorCode>&u=<url>&...
+      //
+      // Gecko maps nsresult codes to string identifiers in
+      // docshell/base/nsDocShellEnumerators.h or via ErrorList.py.
+      // We need entries like:
+      //
+      //   "namecoinNotFound"           → NS_ERROR_NAMECOIN_NOT_FOUND
+      //   "namecoinExpired"            → NS_ERROR_NAMECOIN_EXPIRED
+      //   "namecoinServersUnreachable" → NS_ERROR_NAMECOIN_SERVERS_UNREACHABLE
+      //   "namecoinNoAddress"          → NS_ERROR_NAMECOIN_NO_ADDRESS
+
++     case "namecoinNotFound":
++       document.l10n.setAttributes(titleEl, "neterror-namecoin-not-found-title");
++       document.l10n.setAttributes(shortDescEl, "neterror-namecoin-not-found-short", {
++         hostname: hostName,
++         name: "d/" + hostName.replace(/\.bit$/i, ""),
++       });
++       document.l10n.setAttributes(longDescEl, "neterror-namecoin-not-found-long", {
++         name: "d/" + hostName.replace(/\.bit$/i, ""),
++       });
++       document.l10n.setAttributes(learnMoreEl, "neterror-namecoin-not-found-learn");
++       break;
++
++     case "namecoinExpired":
++       document.l10n.setAttributes(titleEl, "neterror-namecoin-expired-title");
++       document.l10n.setAttributes(shortDescEl, "neterror-namecoin-expired-short", {
++         hostname: hostName,
++         name: "d/" + hostName.replace(/\.bit$/i, ""),
++       });
++       document.l10n.setAttributes(longDescEl, "neterror-namecoin-expired-long", {
++         hostname: hostName,
++         name: "d/" + hostName.replace(/\.bit$/i, ""),
++         updateHeight: getMetaValue("updateHeight") || "unknown",
++         currentHeight: getMetaValue("currentHeight") || "unknown",
++       });
++       break;
++
++     case "namecoinServersUnreachable":
++       document.l10n.setAttributes(titleEl, "neterror-namecoin-servers-unreachable-title");
++       document.l10n.setAttributes(shortDescEl, "neterror-namecoin-servers-unreachable-short", {
++         hostname: hostName,
++       });
++       document.l10n.setAttributes(longDescEl, "neterror-namecoin-servers-unreachable-long");
++       // Show retry button
++       retryBtn.hidden = false;
++       break;
++
++     case "namecoinNoAddress":
++       document.l10n.setAttributes(titleEl, "neterror-namecoin-no-address-title");
++       document.l10n.setAttributes(shortDescEl, "neterror-namecoin-no-address-short", {
++         hostname: hostName,
++         name: "d/" + hostName.replace(/\.bit$/i, ""),
++       });
++       document.l10n.setAttributes(longDescEl, "neterror-namecoin-no-address-long", {
++         name: "d/" + hostName.replace(/\.bit$/i, ""),
++       });
++       break;
+
+diff --git a/docshell/base/nsDocShellEnumerators.h b/docshell/base/nsDocShellEnumerators.h
+--- a/docshell/base/nsDocShellEnumerators.h
++++ b/docshell/base/nsDocShellEnumerators.h
+@@ -XXX,6 +XXX,18 @@
+  // Map nsresult codes to error page string identifiers.
+  // Add these entries to the switch in GetErrorCodeString() or the
+  // equivalent mapping table:
++
++ // Namecoin (.bit) resolution errors
++ case NS_ERROR_NAMECOIN_NOT_FOUND:
++   aErrorCodeString.AssignLiteral("namecoinNotFound");
++   break;
++ case NS_ERROR_NAMECOIN_EXPIRED:
++   aErrorCodeString.AssignLiteral("namecoinExpired");
++   break;
++ case NS_ERROR_NAMECOIN_SERVERS_UNREACHABLE:
++   aErrorCodeString.AssignLiteral("namecoinServersUnreachable");
++   break;
++ case NS_ERROR_NAMECOIN_NO_ADDRESS:
++   aErrorCodeString.AssignLiteral("namecoinNoAddress");
++   break;
+
+diff --git a/toolkit/locales/en-US/toolkit/neterror/netError-namecoin.ftl b/toolkit/locales/en-US/toolkit/neterror/netError-namecoin.ftl
+new file mode 100644
+--- /dev/null
++++ b/toolkit/locales/en-US/toolkit/neterror/netError-namecoin.ftl
+@@ -0,0 +1,3 @@
++# Copy src/netError-namecoin.ftl from the gecko-namecoin project into
++# toolkit/locales/en-US/toolkit/neterror/netError-namecoin.ftl
++# (Full contents in gecko-namecoin/src/netError-namecoin.ftl)

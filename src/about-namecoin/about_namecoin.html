@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<!-- This Source Code Form is subject to the terms of the Mozilla Public
+   - License, v. 2.0. If a copy of the MPL was not distributed with this
+   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Namecoin Diagnostics</title>
+  <style>
+    /* ========================================================================
+     * about:namecoin — Firefox Proton Design Language
+     * Matches about:networking, about:support styling conventions.
+     * Dark/light mode aware via prefers-color-scheme.
+     * ======================================================================== */
+
+    :root {
+      --page-bg: #f9f9fb;
+      --card-bg: #ffffff;
+      --card-border: #e0e0e6;
+      --text-primary: #15141a;
+      --text-secondary: #5b5b66;
+      --text-muted: #8f8f9d;
+      --accent: #0060df;
+      --accent-hover: #0250bb;
+      --success: #058b00;
+      --success-bg: #e4f5e1;
+      --warning: #c27400;
+      --warning-bg: #fff4cc;
+      --error: #d70022;
+      --error-bg: #ffe0e8;
+      --info-bg: #deeafc;
+      --table-header-bg: #f0f0f4;
+      --table-row-hover: #f0f0f4;
+      --input-border: #cfcfd8;
+      --input-bg: #ffffff;
+      --code-bg: #f0f0f4;
+      --separator: #e0e0e6;
+      --font-stack: -apple-system, BlinkMacSystemFont, "Segoe UI", "Ubuntu",
+                    "Helvetica Neue", sans-serif;
+      --mono-stack: "SF Mono", "Fira Code", "Fira Mono", Menlo, monospace;
+      --radius: 8px;
+      --shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --page-bg: #1c1b22;
+        --card-bg: #2b2a33;
+        --card-border: #3a3944;
+        --text-primary: #fbfbfe;
+        --text-secondary: #cfcfd8;
+        --text-muted: #8f8f9d;
+        --accent: #00ddff;
+        --accent-hover: #80ebff;
+        --success: #54d162;
+        --success-bg: rgba(84, 209, 98, 0.15);
+        --warning: #ffbd4f;
+        --warning-bg: rgba(255, 189, 79, 0.15);
+        --error: #ff6a75;
+        --error-bg: rgba(255, 106, 117, 0.15);
+        --info-bg: rgba(0, 221, 255, 0.1);
+        --table-header-bg: #3a3944;
+        --table-row-hover: #3a3944;
+        --input-border: #5b5b66;
+        --input-bg: #1c1b22;
+        --code-bg: #3a3944;
+        --separator: #3a3944;
+        --shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
+      }
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: var(--font-stack);
+      font-size: 14px;
+      line-height: 1.5;
+      color: var(--text-primary);
+      background: var(--page-bg);
+      padding: 40px 20px;
+      max-width: 960px;
+      margin: 0 auto;
+    }
+
+    h1 {
+      font-size: 22px;
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+
+    .page-subtitle {
+      color: var(--text-secondary);
+      font-size: 13px;
+      margin-bottom: 32px;
+    }
+
+    .header-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 4px;
+    }
+
+    .header-row .nmc-logo {
+      width: 32px;
+      height: 32px;
+      border-radius: 6px;
+      background: linear-gradient(135deg, #1a8cff, #0060df);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #fff;
+      font-weight: 700;
+      font-size: 16px;
+      flex-shrink: 0;
+    }
+
+    /* --- Status Banner --- */
+    .status-banner {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 12px 16px;
+      border-radius: var(--radius);
+      margin-bottom: 24px;
+      font-size: 13px;
+      font-weight: 500;
+    }
+    .status-banner.enabled {
+      background: var(--success-bg);
+      color: var(--success);
+      border: 1px solid var(--success);
+    }
+    .status-banner.disabled {
+      background: var(--warning-bg);
+      color: var(--warning);
+      border: 1px solid var(--warning);
+    }
+    .status-banner .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: currentColor;
+      flex-shrink: 0;
+    }
+
+    /* --- Cards --- */
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      margin-bottom: 20px;
+      overflow: hidden;
+    }
+    .card-header {
+      padding: 14px 20px;
+      border-bottom: 1px solid var(--separator);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .card-header h2 {
+      font-size: 15px;
+      font-weight: 600;
+    }
+    .card-header .badge {
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 10px;
+      font-weight: 600;
+    }
+    .badge-ok {
+      background: var(--success-bg);
+      color: var(--success);
+    }
+    .badge-warn {
+      background: var(--warning-bg);
+      color: var(--warning);
+    }
+    .badge-err {
+      background: var(--error-bg);
+      color: var(--error);
+    }
+    .card-body {
+      padding: 16px 20px;
+    }
+
+    /* --- Stat Row --- */
+    .stat-row {
+      display: flex;
+      gap: 24px;
+      flex-wrap: wrap;
+      margin-bottom: 16px;
+    }
+    .stat {
+      flex: 1;
+      min-width: 120px;
+    }
+    .stat-label {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--text-muted);
+      margin-bottom: 2px;
+    }
+    .stat-value {
+      font-size: 20px;
+      font-weight: 600;
+      font-family: var(--mono-stack);
+    }
+
+    /* --- Tables --- */
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    thead th {
+      text-align: left;
+      padding: 8px 12px;
+      background: var(--table-header-bg);
+      color: var(--text-secondary);
+      font-weight: 600;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      border-bottom: 1px solid var(--separator);
+    }
+    tbody td {
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--separator);
+      vertical-align: middle;
+    }
+    tbody tr:last-child td {
+      border-bottom: none;
+    }
+    tbody tr:hover {
+      background: var(--table-row-hover);
+    }
+
+    /* --- Status dots in tables --- */
+    .status-dot {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      margin-right: 6px;
+      vertical-align: middle;
+    }
+    .status-dot.connected { background: var(--success); }
+    .status-dot.disconnected { background: var(--text-muted); }
+    .status-dot.error { background: var(--error); }
+
+    .status-text {
+      font-weight: 500;
+    }
+    .status-text.connected { color: var(--success); }
+    .status-text.disconnected { color: var(--text-muted); }
+    .status-text.error { color: var(--error); }
+
+    .cache-tag {
+      display: inline-block;
+      font-size: 11px;
+      padding: 1px 6px;
+      border-radius: 4px;
+      font-weight: 600;
+    }
+    .cache-hit {
+      background: var(--success-bg);
+      color: var(--success);
+    }
+    .cache-miss {
+      background: var(--info-bg);
+      color: var(--accent);
+    }
+
+    code, .mono {
+      font-family: var(--mono-stack);
+      font-size: 12px;
+    }
+
+    .truncated {
+      max-width: 180px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      display: inline-block;
+      vertical-align: middle;
+    }
+
+    /* --- Name Lookup Tool --- */
+    .lookup-form {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 16px;
+    }
+    .lookup-form input[type="text"] {
+      flex: 1;
+      padding: 8px 12px;
+      border: 1px solid var(--input-border);
+      border-radius: 6px;
+      background: var(--input-bg);
+      color: var(--text-primary);
+      font-family: var(--mono-stack);
+      font-size: 13px;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    .lookup-form input[type="text"]:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(0, 96, 223, 0.2);
+    }
+    .lookup-form input[type="text"]::placeholder {
+      color: var(--text-muted);
+    }
+    .btn {
+      padding: 8px 20px;
+      border: none;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .btn-primary {
+      background: var(--accent);
+      color: #fff;
+    }
+    .btn-primary:hover {
+      background: var(--accent-hover);
+    }
+    .btn-primary:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .lookup-result {
+      display: none;
+    }
+    .lookup-result.visible {
+      display: block;
+    }
+    .lookup-result-section {
+      margin-bottom: 12px;
+    }
+    .lookup-result-section h4 {
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      color: var(--text-muted);
+      margin-bottom: 6px;
+    }
+    .result-box {
+      background: var(--code-bg);
+      border-radius: 6px;
+      padding: 12px 16px;
+      font-family: var(--mono-stack);
+      font-size: 12px;
+      line-height: 1.6;
+      white-space: pre-wrap;
+      word-break: break-all;
+      max-height: 300px;
+      overflow-y: auto;
+    }
+    .result-error {
+      color: var(--error);
+    }
+
+    .parsed-result {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 4px 16px;
+      font-size: 13px;
+    }
+    .parsed-result dt {
+      font-weight: 600;
+      color: var(--text-secondary);
+    }
+    .parsed-result dd {
+      font-family: var(--mono-stack);
+      font-size: 12px;
+    }
+
+    /* --- Empty state --- */
+    .empty-state {
+      text-align: center;
+      padding: 32px 20px;
+      color: var(--text-muted);
+      font-size: 13px;
+    }
+
+    /* --- Footer --- */
+    .page-footer {
+      margin-top: 32px;
+      padding-top: 16px;
+      border-top: 1px solid var(--separator);
+      font-size: 12px;
+      color: var(--text-muted);
+      text-align: center;
+    }
+    .page-footer a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+    .page-footer a:hover {
+      text-decoration: underline;
+    }
+
+    /* Responsive */
+    @media (max-width: 600px) {
+      body { padding: 20px 12px; }
+      .stat-row { gap: 12px; }
+      .stat-value { font-size: 16px; }
+      .lookup-form { flex-direction: column; }
+      table { font-size: 12px; }
+      thead th, tbody td { padding: 6px 8px; }
+    }
+  </style>
+</head>
+<body>
+  <!-- Header -->
+  <div class="header-row">
+    <div class="nmc-logo">N</div>
+    <h1>Namecoin Diagnostics</h1>
+  </div>
+  <p class="page-subtitle">about:namecoin — Monitor .bit domain resolution and ElectrumX connectivity</p>
+
+  <!-- Global status banner -->
+  <div id="status-banner" class="status-banner disabled">
+    <span class="dot"></span>
+    <span id="status-text">Namecoin resolution is disabled</span>
+  </div>
+
+  <!-- Blockchain & Server Stats -->
+  <div class="card">
+    <div class="card-header">
+      <h2>ElectrumX Servers</h2>
+      <span id="servers-badge" class="badge badge-ok">0 / 0 connected</span>
+    </div>
+    <div class="card-body">
+      <div class="stat-row" id="blockchain-stats">
+        <div class="stat">
+          <div class="stat-label">Blockchain Height</div>
+          <div class="stat-value" id="stat-height">—</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Connected Servers</div>
+          <div class="stat-value" id="stat-connected">—</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Avg Latency</div>
+          <div class="stat-value" id="stat-latency">—</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Cache Entries</div>
+          <div class="stat-value" id="stat-cache">—</div>
+        </div>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Server URL</th>
+            <th>Status</th>
+            <th>Latency</th>
+            <th>Block Height</th>
+            <th>Last Seen</th>
+          </tr>
+        </thead>
+        <tbody id="servers-tbody">
+          <tr><td colspan="5" class="empty-state">No servers configured</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Recent Resolution Log -->
+  <div class="card">
+    <div class="card-header">
+      <h2>Recent Resolutions</h2>
+      <span id="resolutions-badge" class="badge badge-ok">0 lookups</span>
+    </div>
+    <div class="card-body">
+      <table>
+        <thead>
+          <tr>
+            <th>Domain</th>
+            <th>Result</th>
+            <th>Time</th>
+            <th>Cache</th>
+            <th>Timestamp</th>
+          </tr>
+        </thead>
+        <tbody id="resolutions-tbody">
+          <tr><td colspan="5" class="empty-state">No recent lookups</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- TLS / DANE Cache -->
+  <div class="card">
+    <div class="card-header">
+      <h2>TLS / DANE Cache</h2>
+      <span id="dane-badge" class="badge badge-ok">0 entries</span>
+    </div>
+    <div class="card-body">
+      <table>
+        <thead>
+          <tr>
+            <th>Domain</th>
+            <th>Cert Fingerprint</th>
+            <th>TLSA Match Type</th>
+            <th>Usage</th>
+            <th>Expiry Block</th>
+          </tr>
+        </thead>
+        <tbody id="dane-tbody">
+          <tr><td colspan="5" class="empty-state">No DANE/TLS entries cached</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Name Lookup Tool -->
+  <div class="card">
+    <div class="card-header">
+      <h2>Name Lookup Tool</h2>
+    </div>
+    <div class="card-body">
+      <div class="lookup-form">
+        <input type="text" id="lookup-input" placeholder="example.bit" autocomplete="off" spellcheck="false">
+        <button class="btn btn-primary" id="lookup-btn">Resolve</button>
+      </div>
+      <div id="lookup-result" class="lookup-result">
+        <div class="lookup-result-section">
+          <h4>Raw JSON Value</h4>
+          <div class="result-box" id="result-raw"></div>
+        </div>
+        <div class="lookup-result-section">
+          <h4>Parsed Result</h4>
+          <dl class="parsed-result" id="result-parsed"></dl>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="page-footer">
+    Namecoin integration is experimental. <a href="https://www.namecoin.org/">Learn more about Namecoin</a> ·
+    <a href="about:config?filter=network.namecoin">Preferences</a> ·
+    <a href="https://www.namecoin.org/docs/electrum-nmc/">ElectrumX Docs</a>
+  </div>
+
+  <script src="chrome://namecoin/content/aboutNamecoin.js"></script>
+</body>
+</html>

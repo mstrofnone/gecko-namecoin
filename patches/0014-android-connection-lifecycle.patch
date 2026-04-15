@@ -1,0 +1,142 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: gecko-namecoin <gecko-namecoin@example.com>
+Date: Thu, 16 Apr 2026 00:00:00 +0000
+Subject: [PATCH 0014] Wire NmcConnectionManager into GeckoView lifecycle
+
+Register NmcConnectionManager as an observer during Gecko startup on
+Android. GeckoView's activity lifecycle callbacks fire observer
+notifications that NmcConnectionManager listens to for foreground/
+background transitions and network changes.
+
+This patch wires:
+  1. NmcConnectionManager creation alongside nsNamecoinResolver::Init()
+  2. Observer registration for geckoview:activity-state-changed
+  3. Cleanup in nsNamecoinResolver::Shutdown()
+
+Bug: (namecoin-integration)
+---
+ netwerk/dns/nsNamecoinResolver.cpp            | 42 +++++++++++++++++++
+ netwerk/dns/nsNamecoinResolver.h              |  8 ++++
+ mobile/android/geckoview/.../GeckoThread.java | 12 ++++++
+ 3 files changed, 62 insertions(+)
+
+diff --git a/netwerk/dns/nsNamecoinResolver.cpp b/netwerk/dns/nsNamecoinResolver.cpp
+index aabbccdd..eeff0011 100644
+--- a/netwerk/dns/nsNamecoinResolver.cpp
++++ b/netwerk/dns/nsNamecoinResolver.cpp
+@@ -25,6 +25,11 @@
+ #include "nsServiceManagerUtils.h"
+ #include "prnetdb.h"
+ 
++#ifdef ANDROID
++#include "android/NmcConnectionManager.h"
++#include "nsIObserverService.h"
++#endif
++
+ namespace mozilla {
+ namespace net {
+ 
+@@ -300,6 +305,21 @@ nsresult nsNamecoinResolver::Init() {
+   mConnectionPool = new nsElectrumXConnectionPool(
+       mConnectionTimeoutMs, idleTTLMs);
+ 
++#ifdef ANDROID
++  // Create and initialize the Android connection lifecycle manager.
++  // It observes app foreground/background transitions and network changes
++  // to manage the WebSocket connection pool for battery efficiency.
++  if (!mConnectionManager) {
++    mConnectionManager = new NmcConnectionManager(this);
++    nsresult cmRv = mConnectionManager->Init();
++    if (NS_FAILED(cmRv)) {
++      NMC_ERR("Failed to initialize NmcConnectionManager: %08x",
++              (unsigned)cmRv);
++      mConnectionManager = nullptr;
++    }
++  }
++#endif
++
+   NMC_LOG("Namecoin resolver initialized: %u servers, timeout=%ums",
+           (unsigned)mServers.Length(), mConnectionTimeoutMs);
+   return NS_OK;
+@@ -320,6 +340,15 @@ void nsNamecoinResolver::Shutdown() {
+     pool->Shutdown();
+   }
+ 
++#ifdef ANDROID
++  if (mConnectionManager) {
++    RefPtr<NmcConnectionManager> cm = mConnectionManager;
++    mConnectionManager = nullptr;
++    lock.Unlock();
++    cm->Shutdown();
++  }
++#endif
++
+   NMC_LOG("Namecoin resolver shut down");
+ }
+ 
+@@ -350,6 +379,13 @@ nsresult nsNamecoinResolver::ResolveInternal(const nsACString& aHostname,
+ 
+   MOZ_ASSERT(!NS_IsMainThread());
+ 
++#ifdef ANDROID
++  // Notify the connection manager of lookup activity so the background
++  // idle timer gets reset (prevents premature WS teardown).
++  if (mConnectionManager) {
++    mConnectionManager->NotifyLookupActivity();
++  }
++#endif
++
+   if (!IsNamecoinHost(aHostname)) {
+     aResult.error.AssignLiteral("Not a .bit hostname");
+     return NS_ERROR_INVALID_ARG;
+diff --git a/netwerk/dns/nsNamecoinResolver.h b/netwerk/dns/nsNamecoinResolver.h
+index 22334455..66778899 100644
+--- a/netwerk/dns/nsNamecoinResolver.h
++++ b/netwerk/dns/nsNamecoinResolver.h
+@@ -15,6 +15,10 @@
+ #include "mozilla/Monitor.h"
+ #include "mozilla/net/DNS.h"
+ 
++#ifdef ANDROID
++class NmcConnectionManager;
++#endif
++
+ namespace mozilla {
+ namespace net {
+ 
+@@ -180,6 +184,10 @@ class nsNamecoinResolver final {
+ 
+   // WebSocket connection pool
+   RefPtr<nsElectrumXConnectionPool> mConnectionPool;
++
++#ifdef ANDROID
++  RefPtr<NmcConnectionManager> mConnectionManager;
++#endif
+ };
+ 
+ }  // namespace net
+diff --git a/mobile/android/geckoview/src/main/java/org/mozilla/geckoview/GeckoThread.java b/mobile/android/geckoview/src/main/java/org/mozilla/geckoview/GeckoThread.java
+index aabb1122..ccdd3344 100644
+--- a/mobile/android/geckoview/src/main/java/org/mozilla/geckoview/GeckoThread.java
++++ b/mobile/android/geckoview/src/main/java/org/mozilla/geckoview/GeckoThread.java
+@@ -40,6 +40,18 @@ public final class GeckoThread extends Thread {
+ 
+     // ... existing lifecycle code ...
+ 
++    /**
++     * Fire a Gecko observer notification for activity lifecycle state changes.
++     * Called from GeckoView's ProcessLifecycleOwner integration.
++     *
++     * @param state "foreground" or "background"
++     */
++    public static void notifyActivityState(@NonNull final String state) {
++        // Dispatches to C++ nsIObserverService:
++        //   topic = "geckoview:activity-state-changed"
++        //   data  = state ("foreground" or "background")
++        nativeNotifyObserver("geckoview:activity-state-changed", state);
++    }
++
+     // ... existing code ...
+ }
+--
+2.43.0

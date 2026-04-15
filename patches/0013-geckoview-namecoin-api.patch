@@ -1,0 +1,222 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: gecko-namecoin <gecko-namecoin@example.com>
+Date: Thu, 16 Apr 2026 00:00:00 +0000
+Subject: [PATCH 0013] GeckoView API surface for Namecoin settings
+
+Expose Namecoin configuration through GeckoRuntimeSettings so embedding
+apps (Fenix, Focus, custom browsers) can enable/disable .bit resolution
+and configure ElectrumX servers at runtime.
+
+Adds:
+  - GeckoRuntimeSettings.Builder.namecoinEnabled(boolean)
+  - GeckoRuntimeSettings.Builder.electrumXServers(String...)
+  - GeckoRuntimeSettings getter/setter pairs
+  - C++ JNI bridge to NmcGeckoViewSettings XPCOM component
+
+Bug: (namecoin-integration)
+---
+ .../geckoview/GeckoRuntimeSettings.java       | 89 +++++++++++++++++++
+ .../org/mozilla/gecko/GeckoAppShell.java      | 15 ++++
+ .../jni/NmcGeckoViewSettingsBridge.cpp        | 78 ++++++++++++++++
+ 3 files changed, 182 insertions(+)
+ create mode 100644 widget/android/jni/NmcGeckoViewSettingsBridge.cpp
+
+diff --git a/mobile/android/geckoview/src/main/java/org/mozilla/geckoview/GeckoRuntimeSettings.java b/mobile/android/geckoview/src/main/java/org/mozilla/geckoview/GeckoRuntimeSettings.java
+index 1234567a..89abcdef 100644
+--- a/mobile/android/geckoview/src/main/java/org/mozilla/geckoview/GeckoRuntimeSettings.java
++++ b/mobile/android/geckoview/src/main/java/org/mozilla/geckoview/GeckoRuntimeSettings.java
+@@ -42,6 +42,8 @@ import org.mozilla.gecko.util.GeckoBundle;
+  public final class GeckoRuntimeSettings extends RuntimeSettings {
+ 
+      private boolean mWebManifest = true;
++     private boolean mNamecoinEnabled = false;
++     private String[] mElectrumXServers = null;
+ 
+      // ... existing fields ...
+ 
+@@ -120,6 +122,42 @@ public final class GeckoRuntimeSettings extends RuntimeSettings {
+              return this;
+          }
+ 
++         /**
++          * Enable or disable Namecoin (.bit) domain resolution.
++          *
++          * When enabled, hostnames ending in ".bit" are resolved via the
++          * Namecoin blockchain through ElectrumX WebSocket servers instead
++          * of standard DNS.
++          *
++          * @param enabled true to enable, false to disable. Default: false.
++          * @return This Builder instance.
++          */
++         public @NonNull Builder namecoinEnabled(final boolean enabled) {
++             getSettings().mNamecoinEnabled = enabled;
++             return this;
++         }
++
++         /**
++          * Set the ElectrumX server URLs for Namecoin resolution.
++          *
++          * Servers are tried in order of preference. URLs must use
++          * {@code wss://} (recommended) or {@code ws://} scheme.
++          *
++          * @param servers One or more ElectrumX WebSocket server URLs.
++          *                Pass null or empty to use built-in defaults.
++          * @return This Builder instance.
++          */
++         public @NonNull Builder electrumXServers(final @Nullable String... servers) {
++             getSettings().mElectrumXServers = servers;
++             return this;
++         }
++
+          // ... existing builder methods ...
+      }
+ 
+@@ -200,6 +238,51 @@ public final class GeckoRuntimeSettings extends RuntimeSettings {
+          return mWebManifest;
+      }
+ 
++     // ---- Namecoin settings ------------------------------------------------
++
++     /**
++      * Set whether Namecoin (.bit) domain resolution is enabled.
++      *
++      * @param enabled true to enable.
++      */
++     public void setNamecoinEnabled(final boolean enabled) {
++         mNamecoinEnabled = enabled;
++         // Push to Gecko preferences via JNI
++         nativeSetNamecoinEnabled(enabled);
++     }
++
++     /**
++      * @return Whether Namecoin resolution is currently enabled.
++      */
++     public boolean getNamecoinEnabled() {
++         return mNamecoinEnabled;
++     }
++
++     /**
++      * Set ElectrumX servers for Namecoin resolution.
++      *
++      * @param servers Server URLs. Null or empty uses built-in defaults.
++      */
++     public void setElectrumXServers(final @Nullable java.util.List<String> servers) {
++         mElectrumXServers = servers != null ? servers.toArray(new String[0]) : null;
++         String[] arr = mElectrumXServers != null ? mElectrumXServers : new String[0];
++         nativeSetElectrumXServers(arr);
++     }
++
++     /**
++      * @return Current ElectrumX server URLs, or empty list if using defaults.
++      */
++     public @NonNull java.util.List<String> getElectrumXServers() {
++         if (mElectrumXServers == null) return java.util.Collections.emptyList();
++         return java.util.Arrays.asList(mElectrumXServers);
++     }
++
++     public void setRequireHttps(final boolean require) {
++         nativeSetRequireHttps(require);
++     }
++
++     public boolean getRequireHttps() {
++         return nativeGetRequireHttps();
++     }
++
+      // ... existing methods ...
+ 
++     // ---- Native JNI bridge ----
++     private static native void nativeSetNamecoinEnabled(boolean enabled);
++     private static native void nativeSetElectrumXServers(String[] servers);
++     private static native void nativeSetRequireHttps(boolean require);
++     private static native boolean nativeGetRequireHttps();
+  }
+diff --git a/widget/android/jni/NmcGeckoViewSettingsBridge.cpp b/widget/android/jni/NmcGeckoViewSettingsBridge.cpp
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/widget/android/jni/NmcGeckoViewSettingsBridge.cpp
+@@ -0,0 +1,78 @@
++/* -*- Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++/**
++ * JNI bridge: GeckoRuntimeSettings native methods → NmcGeckoViewSettings.
++ *
++ * These functions are called from Java via JNI when the embedding app
++ * modifies Namecoin settings through GeckoRuntimeSettings.
++ */
++
++#include "mozilla/jni/Utils.h"
++#include "NmcGeckoViewSettings.h"
++#include "nsServiceManagerUtils.h"
++
++using namespace mozilla::net;
++
++static already_AddRefed<NmcGeckoViewSettings> GetNmcSettings() {
++  nsresult rv;
++  nsCOMPtr<nsINmcGeckoViewSettings> svc =
++      do_GetService(NMC_GECKOVIEWSETTINGS_CONTRACTID, &rv);
++  if (NS_FAILED(rv)) return nullptr;
++  RefPtr<NmcGeckoViewSettings> settings =
++      static_cast<NmcGeckoViewSettings*>(svc.get());
++  return settings.forget();
++}
++
++extern "C" {
++
++JNIEXPORT void JNICALL
++Java_org_mozilla_geckoview_GeckoRuntimeSettings_nativeSetNamecoinEnabled(
++    JNIEnv* env, jclass, jboolean enabled) {
++  RefPtr<NmcGeckoViewSettings> settings = GetNmcSettings();
++  if (settings) {
++    settings->SetNamecoinEnabled(enabled);
++  }
++}
++
++JNIEXPORT void JNICALL
++Java_org_mozilla_geckoview_GeckoRuntimeSettings_nativeSetElectrumXServers(
++    JNIEnv* env, jclass, jobjectArray servers) {
++  RefPtr<NmcGeckoViewSettings> settings = GetNmcSettings();
++  if (!settings) return;
++
++  nsTArray<nsCString> serverList;
++  if (servers) {
++    jsize len = env->GetArrayLength(servers);
++    for (jsize i = 0; i < len; i++) {
++      jstring jstr = (jstring)env->GetObjectArrayElement(servers, i);
++      if (!jstr) continue;
++      const char* utf = env->GetStringUTFChars(jstr, nullptr);
++      if (utf) {
++        serverList.AppendElement(nsCString(utf));
++        env->ReleaseStringUTFChars(jstr, utf);
++      }
++      env->DeleteLocalRef(jstr);
++    }
++  }
++  settings->SetElectrumXServers(serverList);
++}
++
++JNIEXPORT void JNICALL
++Java_org_mozilla_geckoview_GeckoRuntimeSettings_nativeSetRequireHttps(
++    JNIEnv* env, jclass, jboolean require) {
++  RefPtr<NmcGeckoViewSettings> settings = GetNmcSettings();
++  if (settings) {
++    settings->SetRequireHttps(require);
++  }
++}
++
++JNIEXPORT jboolean JNICALL
++Java_org_mozilla_geckoview_GeckoRuntimeSettings_nativeGetRequireHttps(
++    JNIEnv* env, jclass) {
++  RefPtr<NmcGeckoViewSettings> settings = GetNmcSettings();
++  if (!settings) return JNI_TRUE;  // default
++  bool result = true;
++  settings->GetRequireHttps(&result);
++  return result ? JNI_TRUE : JNI_FALSE;
++}
++
++}  // extern "C"
+--
+2.43.0

@@ -1,0 +1,308 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Namecoin Integration <namecoin@example.org>
+Date: Wed, 16 Apr 2026 00:00:00 +0000
+Subject: [PATCH 0012] Settings UI for Namecoin in Privacy & Security
+
+Add a "Namecoin (.bit) Domains" section to the Privacy & Security
+preferences page with:
+  - Toggle to enable/disable .bit resolution (network.namecoin.enabled)
+  - ElectrumX server list (add/remove servers)
+  - Toggle for requiring HTTPS when TLSA records exist
+  - Link to about:namecoin diagnostics page
+
+Settings are placed in the "Security" sub-section of Privacy & Security,
+after the existing HTTPS-Only Mode and Certificate sections.
+
+Bug: XXXXXX — [namecoin] Phase 3: Settings UI
+---
+ browser/components/preferences/privacy.inc.xhtml  | 108 ++++++++++++++++
+ browser/components/preferences/privacy.js          |  95 ++++++++++++++
+ browser/themes/shared/preferences/preferences.css  |  42 ++++++
+ 3 files changed, 245 insertions(+)
+
+--- a/browser/components/preferences/privacy.inc.xhtml
++++ b/browser/components/preferences/privacy.inc.xhtml
+@@ -1400,6 +1400,114 @@
+ 
+   <!-- ====================================================================
+        Namecoin (.bit) Domains — Decentralized DNS Settings
++
++       Placed after "Certificates" in the Security section.
++       All prefs controlled here are registered in StaticPrefList.yaml
++       (see patches/0002-namecoin-prefs.patch).
+        ==================================================================== -->
+ 
++  <hbox id="namecoinCategory"
++        class="subcategory"
++        data-category="panePrivacy">
++    <html:h1 data-l10n-id="settings-namecoin-section-title">
++      Namecoin (.bit) Domains
++    </html:h1>
++  </hbox>
++
++  <vbox id="namecoinSection"
++        data-category="panePrivacy"
++        hidden="true">
++
++    <description class="description-deemphasized"
++                 data-l10n-id="settings-namecoin-section-description">
++      Resolve .bit domains directly from the Namecoin blockchain using
++      ElectrumX servers. This is an experimental feature.
++    </description>
++
++    <!-- Enable/Disable toggle -->
++    <hbox id="namecoinEnableRow" class="pref-row" align="center">
++      <checkbox id="namecoinEnabled"
++                data-l10n-id="settings-namecoin-enable-label"
++                preference="network.namecoin.enabled" />
++    </hbox>
++
++    <description class="indent tip-caption"
++                 data-l10n-id="settings-namecoin-enable-description">
++      When enabled, .bit domains will be resolved via the Namecoin blockchain
++      instead of returning a DNS error.
++    </description>
++
++    <separator class="thin" />
++
++    <!-- ElectrumX Server List -->
++    <vbox id="namecoinServersBox" class="indent">
++      <label data-l10n-id="settings-namecoin-servers-label"
++             control="namecoinServerList">
++        ElectrumX Servers
++      </label>
++      <description class="tip-caption"
++                   data-l10n-id="settings-namecoin-servers-description">
++        List of ElectrumX servers used to query the Namecoin blockchain.
++        One server URL per line (WebSocket: ws:// or wss://).
++      </description>
++
++      <html:textarea id="namecoinServerList"
++                     class="nmc-server-textarea"
++                     rows="4"
++                     data-preference="network.namecoin.electrumx_servers"
++                     placeholder="wss://electrumx-nmc.example.org:50004" />
++
++      <hbox class="nmc-server-buttons" pack="end">
++        <button id="namecoinAddServer"
++                data-l10n-id="settings-namecoin-servers-add"
++                class="small-button"
++                oncommand="gPrivacyPane.namecoinAddServer();" />
++        <button id="namecoinRestoreDefaults"
++                data-l10n-id="settings-namecoin-servers-default"
++                class="small-button"
++                oncommand="gPrivacyPane.namecoinRestoreDefaultServers();" />
++      </hbox>
++    </vbox>
++
++    <separator class="thin" />
++
++    <!-- Require HTTPS toggle -->
++    <hbox id="namecoinRequireTlsRow" class="pref-row indent" align="center">
++      <checkbox id="namecoinRequireTls"
++                data-l10n-id="settings-namecoin-require-tls-label"
++                preference="network.namecoin.require_tls" />
++    </hbox>
++
++    <description class="indent tip-caption"
++                 data-l10n-id="settings-namecoin-require-tls-description">
++      When a .bit domain has DANE-TLSA records on the blockchain, block
++      plain HTTP connections and require TLS.
++    </description>
++
++    <separator class="thin" />
++
++    <!-- Diagnostics link -->
++    <hbox id="namecoinDiagnosticsRow" class="indent" align="center">
++      <label id="namecoinDiagnosticsLink"
++             class="text-link"
++             data-l10n-id="settings-namecoin-diagnostics-link"
++             href="about:namecoin">
++        Open Namecoin Diagnostics
++      </label>
++      <description class="tip-caption"
++                   data-l10n-id="settings-namecoin-diagnostics-description"
++                   flex="1">
++        View ElectrumX server health, recent lookups, and resolve names manually.
++      </description>
++    </hbox>
++
++  </vbox>
+
+--- a/browser/components/preferences/privacy.js
++++ b/browser/components/preferences/privacy.js
+@@ -2800,6 +2800,101 @@ var gPrivacyPane = {
+ 
++  // =========================================================================
++  // Namecoin (.bit) Settings
++  // =========================================================================
++
++  /**
++   * Initialize the Namecoin settings section.
++   * Called from gPrivacyPane.init().
++   */
++  initNamecoinSettings() {
++    const section = document.getElementById("namecoinSection");
++    if (!section) return;
++
++    // Show the section (hidden by default in XHTML for graceful degradation)
++    section.hidden = false;
++
++    // Bind the enable checkbox to the pref
++    const enableCheckbox = document.getElementById("namecoinEnabled");
++    enableCheckbox.checked = Services.prefs.getBoolPref(
++      "network.namecoin.enabled",
++      false
++    );
++    enableCheckbox.addEventListener("command", () => {
++      Services.prefs.setBoolPref(
++        "network.namecoin.enabled",
++        enableCheckbox.checked
++      );
++      this._updateNamecoinControlsState();
++    });
++
++    // Bind the server list textarea to the pref
++    const serverTextarea = document.getElementById("namecoinServerList");
++    const serversPref = Services.prefs.getStringPref(
++      "network.namecoin.electrumx_servers",
++      ""
++    );
++    // Pref stores comma-separated; display one per line
++    serverTextarea.value = serversPref
++      .split(",")
++      .map((s) => s.trim())
++      .filter(Boolean)
++      .join("\n");
++
++    serverTextarea.addEventListener("change", () => {
++      const servers = serverTextarea.value
++        .split("\n")
++        .map((s) => s.trim())
++        .filter(Boolean)
++        .join(",");
++      Services.prefs.setStringPref(
++        "network.namecoin.electrumx_servers",
++        servers
++      );
++    });
++
++    // Bind the require TLS checkbox
++    const tlsCheckbox = document.getElementById("namecoinRequireTls");
++    tlsCheckbox.checked = Services.prefs.getBoolPref(
++      "network.namecoin.require_tls",
++      true
++    );
++    tlsCheckbox.addEventListener("command", () => {
++      Services.prefs.setBoolPref(
++        "network.namecoin.require_tls",
++        tlsCheckbox.checked
++      );
++    });
++
++    this._updateNamecoinControlsState();
++  },
++
++  /**
++   * Enable/disable sub-controls based on the main toggle.
++   */
++  _updateNamecoinControlsState() {
++    const enabled = document.getElementById("namecoinEnabled").checked;
++    const controls = [
++      "namecoinServerList",
++      "namecoinAddServer",
++      "namecoinRestoreDefaults",
++      "namecoinRequireTls",
++    ];
++    for (const id of controls) {
++      const el = document.getElementById(id);
++      if (el) el.disabled = !enabled;
++    }
++  },
++
++  /**
++   * Add a new server URL to the list (prompts user).
++   */
++  namecoinAddServer() {
++    const url = { value: "" };
++    const ok = Services.prompt.prompt(
++      window,
++      "Add ElectrumX Server",
++      "Enter the WebSocket URL of the ElectrumX server (ws:// or wss://):",
++      url,
++      null,
++      { value: false }
++    );
++    if (ok && url.value.trim()) {
++      const textarea = document.getElementById("namecoinServerList");
++      const current = textarea.value.trim();
++      textarea.value = current ? current + "\n" + url.value.trim() : url.value.trim();
++      textarea.dispatchEvent(new Event("change"));
++    }
++  },
++
++  /**
++   * Restore the default ElectrumX server list.
++   */
++  namecoinRestoreDefaultServers() {
++    const defaults = "wss://electrumx-nmc.example.org:50004";
++    const textarea = document.getElementById("namecoinServerList");
++    textarea.value = defaults;
++    textarea.dispatchEvent(new Event("change"));
++  },
++
+   // ... rest of gPrivacyPane ...
+
+--- a/browser/themes/shared/preferences/preferences.css
++++ b/browser/themes/shared/preferences/preferences.css
+@@ -800,6 +800,48 @@
+   /* existing preference styles */
+ }
+ 
++/* =========================================================================
++ * Namecoin (.bit) Settings Section
++ * ========================================================================= */
++
++#namecoinSection {
++  margin-block-start: 16px;
++}
++
++#namecoinSection .pref-row {
++  margin-block-end: 4px;
++}
++
++.nmc-server-textarea {
++  width: 100%;
++  min-height: 80px;
++  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
++  font-size: 13px;
++  padding: 8px;
++  border: 1px solid var(--in-content-border-color, #cfcfd8);
++  border-radius: 4px;
++  background: var(--in-content-box-background, #fff);
++  color: var(--in-content-text-color, #15141a);
++  resize: vertical;
++  margin-block: 4px;
++}
++
++.nmc-server-textarea:focus {
++  border-color: var(--in-content-primary-button-background, #0060df);
++  outline: 2px solid var(--in-content-focus-outline-color, rgba(0, 96, 223, 0.25));
++  outline-offset: -1px;
++}
++
++.nmc-server-buttons {
++  gap: 8px;
++  margin-block-start: 4px;
++}
++
++#namecoinDiagnosticsLink {
++  margin-block-start: 8px;
++  font-size: 13px;
++}
++
++#namecoinDiagnosticsLink + .tip-caption {
++  margin-inline-start: 8px;
++}
+--
+2.43.0

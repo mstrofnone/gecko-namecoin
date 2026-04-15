@@ -1,0 +1,72 @@
+From: Namecoin Integration <namecoin-integration@example.com>
+Date: 2026-04-16
+Subject: [PATCH 3/4] netwerk/dns: Add nsNamecoinResolver class
+
+Adds nsNamecoinResolver.h and nsNamecoinResolver.cpp to netwerk/dns/,
+implementing native Namecoin (.bit) domain resolution via ElectrumX.
+
+This is Phase 1: DNS resolution only (A/AAAA records from blockchain).
+No TLS/DANE validation yet (Phase 2).
+
+Architecture overview:
+  - nsNamecoinResolver::Resolve() dispatches to background thread pool
+  - ResolveInternal() drives the full resolution pipeline:
+      1. Compute ElectrumX scripthash (OP_NAME_UPDATE index script + SHA-256)
+      2. Query blockchain.scripthash.get_history
+      3. Pick most recent confirmed tx
+      4. Query blockchain.transaction.get (verbose)
+      5. Check current block height (expiry: >36,000 blocks)
+      6. Decode NAME_UPDATE output → JSON value
+      7. Parse ip/ip6/alias/translate/map fields
+      8. Follow alias chain (max hops via pref)
+      9. Convert addresses to NetAddr
+      10. Compute cache TTL from remaining blocks
+  - ElectrumXRequest() uses nsIWebSocketChannel (Gecko's WS stack)
+  - SHA-256 via NSS HASH_HashBuf
+
+Static helpers exposed for testing:
+  - ComputeScripthash(name) → ElectrumX scripthash hex
+  - DecodeNameScript(hex) → name + value strings
+  - IsNamecoinHost(hostname) → bool
+  - ParseNameValue(json, hostname) → NamecoinNameValue
+
+Also adds nsNamecoinResolver to netwerk/dns/moz.build.
+
+Key correctness note:
+  The scripthash computation MUST use OP_NAME_UPDATE (0x53). Using
+  OP_NAME_SHOW (0xd1) produces empty query results — silent failure.
+  Verified against electrumx.testls.space for d/testls and d/bitcoin.
+
+Reference implementation:
+  tls-namecoin-ext/background/electrumx-ws.js (JavaScript)
+  tls-namecoin-ext/background/namecoin-resolver.js (JavaScript)
+
+Bug: <to be filed on bugzilla.mozilla.org>
+Reviewed-by: <pending>
+
+---
+ netwerk/dns/moz.build             |   2 +
+ netwerk/dns/nsNamecoinResolver.h   | (see gecko-namecoin/src/)
+ netwerk/dns/nsNamecoinResolver.cpp | (see gecko-namecoin/src/)
+ 3 files changed, ~500 insertions(+)
+
+diff --git a/netwerk/dns/moz.build b/netwerk/dns/moz.build
+index aaaabbbb..ccccdddd 100644
+--- a/netwerk/dns/moz.build
++++ b/netwerk/dns/moz.build
+@@ -65,6 +65,8 @@ UNIFIED_SOURCES += [
+     "nsIDNService.cpp",
+     "nsDNSService.cpp",
+     "nsHostResolver.cpp",
++    "nsNamecoinResolver.cpp",
+ ]
+ 
+ EXPORTS.mozilla.net += [
+@@ -75,6 +77,7 @@ EXPORTS.mozilla.net += [
+     "DNS.h",
+     "HostRecordQueue.h",
+     "nsHostResolver.h",
++    "nsNamecoinResolver.h",
+ ]
+ 
+ LOCAL_INCLUDES += [
