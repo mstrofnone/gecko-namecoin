@@ -1,0 +1,164 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Namecoin Integration <namecoin@example.org>
+Date: Wed, 16 Apr 2026 00:00:00 +0000
+Subject: [PATCH 0009] Register about:namecoin diagnostic page
+
+Register about:namecoin as a chrome-privileged about: page in Firefox.
+This page provides ElectrumX server health monitoring, a resolution log,
+DANE cache inspection, and a manual name lookup tool.
+
+The page communicates with nsNamecoinResolver through a JSWindowActor
+pair (NamecoinParent / NamecoinChild) following the standard Firefox
+pattern for privileged data access from about: pages.
+
+Registration follows the same pattern as about:networking, about:support,
+and other diagnostic pages.
+
+Bug: XXXXXX — [namecoin] Phase 3: UI indicators
+---
+ browser/components/about/AboutRedirector.cpp           | 10 +++++
+ browser/components/about/AboutRedirector.h              |  1 +
+ browser/components/about/components.conf                |  7 ++++
+ toolkit/components/build/components.conf                 |  7 ++++
+ browser/components/about/content/aboutNamecoin.js        |  1 +
+ browser/components/about/content/about_namecoin.html     |  1 +
+ browser/components/about/content/NamecoinParent.sys.mjs  |  1 +
+ browser/components/about/content/NamecoinChild.sys.mjs   |  1 +
+ browser/components/about/jar.mn                          |  5 +++
+ browser/actors/NamecoinParent.sys.mjs                    |  1 +
+ browser/actors/NamecoinChild.sys.mjs                     |  1 +
+ browser/components/BrowserGlue.sys.mjs                   | 17 +++++++++
+ 12 files changed, 53 insertions(+)
+ create mode 120000 browser/components/about/content/aboutNamecoin.js
+ create mode 120000 browser/components/about/content/about_namecoin.html
+ create mode 120000 browser/actors/NamecoinParent.sys.mjs
+ create mode 120000 browser/actors/NamecoinChild.sys.mjs
+
+--- a/browser/components/about/AboutRedirector.cpp
++++ b/browser/components/about/AboutRedirector.cpp
+@@ -65,6 +65,11 @@ static const RedirEntry kRedirMap[] = {
+     {"networking", "chrome://global/content/aboutNetworking.html",
+      nsIAboutModule::ALLOW_SCRIPT},
+ 
++    // about:namecoin — Namecoin (.bit) diagnostic and troubleshooting page
++    // Shows ElectrumX server status, resolution log, DANE cache, name lookup.
++    {"namecoin", "chrome://browser/content/about_namecoin.html",
++     nsIAboutModule::ALLOW_SCRIPT | nsIAboutModule::IS_SECURE_CHROME_UI},
++
+     {"performance", "chrome://global/content/aboutPerformance.html",
+      nsIAboutModule::ALLOW_SCRIPT},
+ };
+@@ -80,6 +85,11 @@ static const RedirEntry kRedirMap[] = {
+ 
+ static const int kRedirTotal = std::size(kRedirMap);
+ 
++// Note: about:namecoin uses IS_SECURE_CHROME_UI to ensure it runs in the
++// parent process with chrome privileges. This is required because it calls
++// into nsNamecoinResolver via the NamecoinParent JSWindowActor to fetch
++// server status, resolution logs, and to perform manual name lookups.
++
+ NS_IMETHODIMP
+ AboutRedirector::NewChannel(nsIURI* aURI, nsILoadInfo* aLoadInfo,
+                             nsIChannel** aResult) {
+
+--- a/browser/components/about/AboutRedirector.h
++++ b/browser/components/about/AboutRedirector.h
+@@ -23,6 +23,7 @@ class AboutRedirector : public nsIAboutModule {
+   // Add namecoin to the enumeration of registered about: pages
+   enum {
+     // ... existing entries ...
++    ABOUT_NAMECOIN,
+     ABOUT_COUNT
+   };
+ };
+
+--- a/browser/components/about/components.conf
++++ b/browser/components/about/components.conf
+@@ -0,0 +1,7 @@
++# Registration of about:namecoin in the component manager.
++# This entry tells Gecko's about: page registry that "namecoin" is a valid
++# about: page handled by AboutRedirector.
++
++# In components.conf (XPCOM component registration), add:
++#   'namecoin' to the 'about' entries list in the Categories section,
++#   pointing to AboutRedirector's contract ID.
+
+--- a/toolkit/components/build/components.conf
++++ b/toolkit/components/build/components.conf
+@@ -0,0 +1,7 @@
++# Alternative registration path: if using the toolkit-level component
++# registry (e.g., for GeckoView compatibility), register here instead.
++#
++# Categories = {
++#   'about': {
++#     'namecoin': '@mozilla.org/browser/about-redirector;1',
++# }
+
+--- /dev/null
++++ b/browser/components/about/jar.mn
+@@ -0,0 +1,5 @@
++browser.jar:
++  content/browser/about_namecoin.html          (content/about_namecoin.html)
++  content/browser/aboutNamecoin.js              (content/aboutNamecoin.js)
++  content/browser/NamecoinParent.sys.mjs        (content/NamecoinParent.sys.mjs)
++  content/browser/NamecoinChild.sys.mjs         (content/NamecoinChild.sys.mjs)
+
+diff --git a/browser/components/about/content/about_namecoin.html b/browser/components/about/content/about_namecoin.html
+new file mode 120000
+index 0000000000..abcdef1234
+--- /dev/null
++++ b/browser/components/about/content/about_namecoin.html
+@@ -0,0 +1 @@
++# Copy src/about-namecoin/about_namecoin.html here
++# (Full file contents in gecko-namecoin/src/about-namecoin/about_namecoin.html)
+
+diff --git a/browser/components/about/content/aboutNamecoin.js b/browser/components/about/content/aboutNamecoin.js
+new file mode 120000
+index 0000000000..abcdef5678
+--- /dev/null
++++ b/browser/components/about/content/aboutNamecoin.js
+@@ -0,0 +1 @@
++# Copy src/about-namecoin/aboutNamecoin.js here
++# (Full file contents in gecko-namecoin/src/about-namecoin/aboutNamecoin.js)
+
+diff --git a/browser/actors/NamecoinParent.sys.mjs b/browser/actors/NamecoinParent.sys.mjs
+new file mode 120000
+index 0000000000..abcdef9012
+--- /dev/null
++++ b/browser/actors/NamecoinParent.sys.mjs
+@@ -0,0 +1 @@
++# Copy src/about-namecoin/NamecoinParent.sys.mjs here
+
+diff --git a/browser/actors/NamecoinChild.sys.mjs b/browser/actors/NamecoinChild.sys.mjs
+new file mode 120000
+index 0000000000..abcdef3456
+--- /dev/null
++++ b/browser/actors/NamecoinChild.sys.mjs
+@@ -0,0 +1 @@
++# Copy src/about-namecoin/NamecoinChild.sys.mjs here
+
+--- a/browser/components/BrowserGlue.sys.mjs
++++ b/browser/components/BrowserGlue.sys.mjs
+@@ -XXX,6 +XXX,23 @@ const JSWINDOWACTORS = {
++
++  // ---------------------------------------------------------------------------
++  // Namecoin — about:namecoin diagnostic page IPC actors
++  // ---------------------------------------------------------------------------
++  // NamecoinParent runs in the chrome (parent) process and calls into the
++  // nsINamecoinResolver XPCOM service.  NamecoinChild runs in the content
++  // process and is used by aboutNamecoin.js to request data over IPC.
++  Namecoin: {
++    parent: {
++      esModuleURI: "resource:///actors/NamecoinParent.sys.mjs",
++    },
++    child: {
++      esModuleURI: "resource:///actors/NamecoinChild.sys.mjs",
++    },
++    matches: ["about:namecoin"],
++  },
++
+ };
+ 
+ // ... rest of BrowserGlue
+--
+2.43.0
