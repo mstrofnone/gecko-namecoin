@@ -877,6 +877,31 @@ Phase 3: Upstream Exploration (Tier 3) — Months 4+
   [ ] Gather community testing feedback
   [ ] Iterate on patches based on review
 
+Phase 5: Three-Stage Enablement Gating — 🔄 IN PROGRESS
+---------------------------------------------------------
+Mozilla's standard graduation path: about:config → Settings toggle → default-off.
+All stages keep the feature default-off.
+
+  Stage A (Nightly) — 🔄 In Progress:
+  [x] patches/0016-namecoin-phase5-enablement.patch
+  [x] src/NamecoinFeature.sys.mjs — JS feature gate module
+  [x] StaticPrefList.yaml: network.namecoin.settings_visible pref
+  [x] Privacy.js gating: section hidden unless settings_visible or Nightly
+  [x] Telemetry scalars: namecoin.settings_visible, namecoin.enabled_changed
+  [ ] Integration testing on Nightly build
+
+  Stage B (Beta) — Not started:
+  [ ] Normandy experiment: namecoin-stage-b-beta-rollout
+  [ ] Gradual rollout: 1% → 10% → 50% over 2–3 Beta cycles
+  [ ] Telemetry monitoring dashboard
+  [ ] Success criteria: <0.1% crash increase, <50ms p95 DNS latency delta
+
+  Stage C (Release) — Not started:
+  [ ] Ship settings_visible = true as default
+  [ ] Remove Normandy experiment dependency
+  [ ] Release notes entry
+  [ ] Default-on decision (separate future phase)
+
 
 ================================================================================
 SECTION 7: SECURITY CONSIDERATIONS
