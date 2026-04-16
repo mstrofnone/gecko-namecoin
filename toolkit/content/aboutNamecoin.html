@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+  <meta charset="utf-8" />
+  <title>Namecoin Settings</title>
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src chrome:; object-src 'none'" />
+  <link rel="stylesheet" href="chrome://global/skin/in-content/common.css" />
+</head>
+<body>
+  <h1>Namecoin (.bit) DNS</h1>
+  <p>Namecoin provides decentralized DNS for <code>.bit</code> domains using the Namecoin blockchain.</p>
+  <h2>Configuration</h2>
+  <p>To enable .bit resolution, go to <a href="about:config">about:config</a> and set:</p>
+  <ul>
+    <li><code>network.namecoin.enabled</code> → <code>true</code></li>
+    <li><code>network.namecoin.electrumx_servers</code> → ElectrumX server URL(s)</li>
+  </ul>
+  <h2>Test</h2>
+  <p>Try navigating to <a href="http://testls.bit">http://testls.bit</a> to test resolution.</p>
+  <h2>Status</h2>
+  <div id="status">Loading...</div>
+  <script>
+  // Simple status check via about:config pref
+  const enabled = false; // Will be wired to real pref via XPCOM
+  document.getElementById("status").textContent =
+    "Namecoin resolution is " + (enabled ? "ENABLED" : "DISABLED") +
+    ". Enable via network.namecoin.enabled in about:config.";
+  </script>
+</body>
+</html>
