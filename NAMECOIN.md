@@ -11,7 +11,7 @@ This is a patch series against [mozilla-central](https://github.com/mozilla/geck
   - **Method 2 (Address signature):** Domain owner signs a message with their Namecoin wallet — no TLSA in blockchain needed
   - **Method 3 (Dehydrated certificate):** Compact cert representation stored directly in the blockchain (IFA-0003 `d8` format)
 - **AIA URL interception** for `aia.x--nmc.bit`: synthesizes intermediate CA data from the URL's `pub=` SPKI parameter without any HTTP fetch
-- **From-scratch secp256k1 ECDSA** because Firefox/NSS does not support this curve (see [Why secp256k1 from scratch?](#why-secp256k1-from-scratch))
+- **From-scratch secp256k1 ECDSA** required for Method 2 (Namecoin address signature verification) because Firefox/NSS does not support this curve (see [Why secp256k1 from scratch?](#why-secp256k1-from-scratch))
 
 ## Table of Contents
 
