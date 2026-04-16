@@ -1251,6 +1251,12 @@ nsresult nsHostResolver::NameLookup(nsHostRecord* rec,
             addrRec->StoreNativeUsed(true);
             addrRec->mResolving++;
 
+            // Store the name value (including TLSA records) so that
+            // SSLServerCertVerification can retrieve it for DANE validation
+            // during the TLS handshake (Phase 2 hook-in).
+            nsNamecoinResolver::StoreNameValue(
+                hostCopy, nmcResult.nameValue, nmcResult.ttlSeconds);
+
             CompleteLookupLocked(rec, NS_OK, ai, rec->pb, rec->originSuffix,
                                  TRRSkippedReason::TRR_DISABLED_FLAG, nullptr,
                                  aLock);

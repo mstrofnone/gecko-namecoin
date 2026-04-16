@@ -109,6 +109,7 @@
 #include "mozilla/Casting.h"
 #include "mozilla/RefPtr.h"
 #include "mozilla/StaticPrefs_security.h"
+#include "mozilla/StaticPrefs_network.h"
 #include "mozilla/UniquePtr.h"
 #include "mozilla/Unused.h"
 #include "mozilla/glean/SecurityManagerSslMetrics.h"
@@ -127,6 +128,9 @@
 #include "nsString.h"
 #include "nsURLHelper.h"
 #include "nsXPCOMCIDInternal.h"
+// Namecoin DANE Phase 2 hook-in
+#include "nsNamecoinResolver.h"
+#include "NmcDaneValidator.h"
 #include "mozpkix/pkix.h"
 #include "mozpkix/pkixcheck.h"
 #include "mozpkix/pkixnss.h"
@@ -822,6 +826,121 @@ SSLServerCertVerificationJob::Run() {
 
   mozilla::glean::cert_verification_time::failure.AccumulateRawDuration(
       elapsed);
+
+  // -------------------------------------------------------------------------
+  // Namecoin DANE Phase 2: If standard CA validation failed for a .bit domain,
+  // attempt DANE-TLSA validation using records from the Namecoin blockchain.
+  // If DANE validation succeeds, treat the connection as valid.
+  // -------------------------------------------------------------------------
+  if (mozilla::net::nsNamecoinResolver::IsNamecoinHost(mHostName) &&
+      StaticPrefs::network_namecoin_enabled()) {
+    MOZ_LOG(gPIPNSSLog, LogLevel::Debug,
+            ("[0x%" PRIx64 "] SSLServerCertVerificationJob: .bit domain %s, "
+             "attempting DANE validation (CA error: %d)",
+             mAddrForLogging, mHostName.get(),
+             (int)MapResultToPRErrorCode(result)));
+
+    mozilla::net::NamecoinNameValue nameValue;
+    if (mozilla::net::nsNamecoinResolver::GetStoredNameValue(mHostName,
+                                                              nameValue) &&
+        !nameValue.tls.IsEmpty()) {
+      // Decode the server cert from its DER bytes for DANE validation.
+      // certBytes was moved-from above; we still have mPeerCertChain[0].
+      const nsTArray<uint8_t>& serverCertDER = mPeerCertChain.ElementAt(0);
+      SECItem derItem;
+      derItem.type = siDERCertBuffer;
+      derItem.data = const_cast<uint8_t*>(serverCertDER.Elements());
+      derItem.len  = serverCertDER.Length();
+
+      CERTCertificate* serverCert =
+          CERT_NewTempCertificate(CERT_GetDefaultCertDB(), &derItem,
+                                  nullptr, PR_FALSE, PR_TRUE);
+      if (serverCert) {
+        // Build a CERTCertList from the peer chain for DANE-TA (usage 2)
+        // chain walking. Chain certs are in mPeerCertChain[1..].
+        CERTCertList* certChain = CERT_NewCertList();
+        for (size_t i = 1; i < mPeerCertChain.Length(); i++) {
+          const nsTArray<uint8_t>& chainDER = mPeerCertChain.ElementAt(i);
+          SECItem chainItem;
+          chainItem.type = siDERCertBuffer;
+          chainItem.data = const_cast<uint8_t*>(chainDER.Elements());
+          chainItem.len  = chainDER.Length();
+          CERTCertificate* chainCert =
+              CERT_NewTempCertificate(CERT_GetDefaultCertDB(), &chainItem,
+                                     nullptr, PR_FALSE, PR_TRUE);
+          if (chainCert) {
+            // CERT_AddCertToListTail takes ownership of chainCert.
+            CERT_AddCertToListTail(certChain, chainCert);
+          }
+        }
+
+        mozilla::net::NmcDaneValidateResult daneResult =
+            mozilla::net::NmcValidateDane(nameValue, serverCert, certChain,
+                                          mHostName, (uint16_t)mPort);
+
+        CERT_DestroyCertificate(serverCert);
+        CERT_DestroyCertList(certChain);
+
+        if (daneResult == mozilla::net::NmcDaneValidateResult::NMC_DANE_OK) {
+          MOZ_LOG(gPIPNSSLog, LogLevel::Debug,
+                  ("[0x%" PRIx64 "] SSLServerCertVerificationJob: DANE-TLSA "
+                   "validation PASSED for %s — overriding CA failure",
+                   mAddrForLogging, mHostName.get()));
+
+          // DANE validated — dispatch success, ignoring CA failure.
+          mozilla::glean::cert_verification_time::success
+              .AccumulateRawDuration(elapsed);
+          glean::ssl::cert_error_overrides.AccumulateSingleSample(1);
+
+          nsresult dispRv = mResultTask->Dispatch(
+              std::move(builtChainBytesArray), std::move(mPeerCertChain),
+              TransportSecurityInfo::ConvertCertificateTransparencyInfoToStatus(
+                  certificateTransparencyInfo),
+              EVStatus::NotEV, true, 0,
+              nsITransportSecurityInfo::OverridableErrorCategory::ERROR_UNSET,
+              false, mProviderFlags, madeOCSPRequests);
+          if (NS_FAILED(dispRv)) {
+            Unused << mResultTask.forget();
+          }
+          return dispRv;
+        } else if (daneResult ==
+                   mozilla::net::NmcDaneValidateResult::NMC_DANE_FAIL) {
+          // TLSA records exist but cert doesn't match — hard fail.
+          // Do NOT allow the user to click through: the blockchain explicitly
+          // specifies which certs are trusted and this isn't one of them.
+          MOZ_LOG(gPIPNSSLog, LogLevel::Error,
+                  ("[0x%" PRIx64 "] SSLServerCertVerificationJob: DANE-TLSA "
+                   "validation FAILED for %s — rejecting connection",
+                   mAddrForLogging, mHostName.get()));
+          nsresult dispRv = mResultTask->Dispatch(
+              std::move(builtChainBytesArray), std::move(mPeerCertChain),
+              TransportSecurityInfo::ConvertCertificateTransparencyInfoToStatus(
+                  certificateTransparencyInfo),
+              EVStatus::NotEV, false,
+              SEC_ERROR_UNTRUSTED_CERT,
+              nsITransportSecurityInfo::OverridableErrorCategory::ERROR_TRUST,
+              false, mProviderFlags, madeOCSPRequests);
+          if (NS_FAILED(dispRv)) {
+            Unused << mResultTask.forget();
+          }
+          return dispRv;
+        }
+        // NMC_DANE_NO_RECORD: fall through to normal error handling below
+        MOZ_LOG(gPIPNSSLog, LogLevel::Debug,
+                ("[0x%" PRIx64 "] SSLServerCertVerificationJob: no TLSA "
+                 "records for %s — falling through to standard error",
+                 mAddrForLogging, mHostName.get()));
+      }
+    } else {
+      MOZ_LOG(gPIPNSSLog, LogLevel::Debug,
+              ("[0x%" PRIx64 "] SSLServerCertVerificationJob: no stored name "
+               "value or no TLSA records for %s",
+               mAddrForLogging, mHostName.get()));
+    }
+  }
+  // -------------------------------------------------------------------------
+  // End Namecoin DANE hook-in
+  // -------------------------------------------------------------------------
 
   PRErrorCode error = MapResultToPRErrorCode(result);
   nsITransportSecurityInfo::OverridableErrorCategory overridableErrorCategory =

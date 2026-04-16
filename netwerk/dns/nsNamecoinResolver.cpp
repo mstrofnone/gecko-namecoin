@@ -1469,6 +1469,32 @@ static void NmcPopulateNameValue(const NmcJsonValue& obj, NamecoinNameValue& out
   }
 
   out.hasMap = (obj.Get("map") != nullptr && obj.Get("map")->IsObject());
+
+  // Also collect TLSA records from map["*"] (wildcard applies to the current
+  // level and is used by testls.bit / x--nmc AIA scheme for apex TLSA).
+  {
+    const NmcJsonValue* mapNode = obj.Get("map");
+    if (mapNode && mapNode->IsObject()) {
+      const NmcJsonValue* wildcard = mapNode->Get("*");
+      if (wildcard && wildcard->IsObject()) {
+        const NmcJsonValue* wTls = wildcard->Get("tls");
+        if (wTls && wTls->IsArray()) {
+          for (const auto& entry : wTls->arrayVal) {
+            if (!entry.IsArray() || entry.arrayVal.Length() < 4) continue;
+            const auto& a = entry.arrayVal;
+            if (!a[0].IsNumber() || !a[1].IsNumber() || !a[2].IsNumber()) continue;
+            if (!a[3].IsString()) continue;
+            NamecoinTLSARecord rec;
+            rec.usage     = (uint8_t)(int)a[0].numVal;
+            rec.selector  = (uint8_t)(int)a[1].numVal;
+            rec.matchType = (uint8_t)(int)a[2].numVal;
+            rec.data      = a[3].strVal;
+            out.tls.AppendElement(std::move(rec));
+          }
+        }
+      }
+    }
+  }
 }
 
 // Extract subdomain labels from a lowercased hostname.
@@ -1987,6 +2013,63 @@ int32_t nsNamecoinResolver::TestConnectivity() {
   uint32_t height = 0;
   GetCurrentBlockHeight(height);
   return (int32_t)height;
+}
+
+// ---------------------------------------------------------------------------
+// Static name-value cache — shared across all instances, accessible to
+// SSLServerCertVerification.cpp for DANE hook-in (Phase 2).
+// ---------------------------------------------------------------------------
+
+/* static */ mozilla::StaticMutex nsNamecoinResolver::sNameValueCacheMutex;
+/* static */ nsTHashMap<nsCStringHashKey, nsNamecoinResolver::NameValueCacheEntry>
+    nsNamecoinResolver::sNameValueCache;
+
+/* static */ void nsNamecoinResolver::StoreNameValue(
+    const nsACString& aHostname,
+    const NamecoinNameValue& aValue,
+    uint32_t aTTLSeconds) {
+  mozilla::StaticMutexAutoLock lock(sNameValueCacheMutex);
+
+  NameValueCacheEntry entry;
+  entry.value = aValue;
+  entry.expiry = mozilla::TimeStamp::Now() +
+                 mozilla::TimeDuration::FromSeconds((double)aTTLSeconds);
+
+  nsCString key(aHostname);
+  ToLowerCase(key);
+  sNameValueCache.InsertOrUpdate(key, std::move(entry));
+
+  NMC_LOG("StoreNameValue: cached name value for %s (ttl=%us, tlsa=%zu)",
+           nsPromiseFlatCString(aHostname).get(),
+           aTTLSeconds,
+           aValue.tls.Length());
+}
+
+/* static */ bool nsNamecoinResolver::GetStoredNameValue(
+    const nsACString& aHostname,
+    NamecoinNameValue& aValue) {
+  mozilla::StaticMutexAutoLock lock(sNameValueCacheMutex);
+
+  nsCString key(aHostname);
+  ToLowerCase(key);
+
+  auto* entry = sNameValueCache.Lookup(key).DataPtrOrNull();
+  if (!entry) {
+    return false;
+  }
+
+  if (mozilla::TimeStamp::Now() > entry->expiry) {
+    sNameValueCache.Remove(key);
+    NMC_LOG("GetStoredNameValue: expired entry for %s",
+             nsPromiseFlatCString(aHostname).get());
+    return false;
+  }
+
+  aValue = entry->value;
+  NMC_LOG("GetStoredNameValue: found %zu TLSA records for %s",
+           aValue.tls.Length(),
+           nsPromiseFlatCString(aHostname).get());
+  return true;
 }
 
 }  // namespace net

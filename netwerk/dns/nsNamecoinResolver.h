@@ -46,9 +46,11 @@
 #include "mozilla/RefPtr.h"
 #include "mozilla/UniquePtr.h"
 #include "mozilla/Mutex.h"
+#include "mozilla/StaticMutex.h"
 #include "mozilla/net/DNS.h"
 #include "nsITimer.h"
 #include "mozilla/Monitor.h"
+#include "nsTHashMap.h"
 #include "NmcDaneValidator.h"
 
 namespace mozilla {
@@ -69,6 +71,12 @@ struct NamecoinTLSARecord {
   uint8_t selector;     // 0=full cert, 1=SPKI
   uint8_t matchType;    // 0=exact, 1=SHA-256, 2=SHA-512
   nsCString data;       // hex or base64 encoded cert/hash
+
+  NamecoinTLSARecord() = default;
+  NamecoinTLSARecord(const NamecoinTLSARecord&) = default;
+  NamecoinTLSARecord& operator=(const NamecoinTLSARecord&) = default;
+  NamecoinTLSARecord(NamecoinTLSARecord&&) = default;
+  NamecoinTLSARecord& operator=(NamecoinTLSARecord&&) = default;
 };
 
 struct NamecoinNameValue {
@@ -83,6 +91,35 @@ struct NamecoinNameValue {
   // map: subdomain → NamecoinNameValue (simplified as nested JSON for now)
   // Full map traversal implemented in Resolve() directly
   bool hasMap = false;
+
+  NamecoinNameValue() = default;
+  NamecoinNameValue(NamecoinNameValue&&) = default;
+  NamecoinNameValue& operator=(NamecoinNameValue&&) = default;
+
+  // Deep copy via nsTArray::Clone()
+  NamecoinNameValue(const NamecoinNameValue& aOther)
+      : ip(aOther.ip),
+        ip6(aOther.ip6),
+        ns(aOther.ns.Clone()),
+        tls(aOther.tls.Clone()),
+        alias(aOther.alias),
+        translate(aOther.translate),
+        tor(aOther.tor),
+        hasMap(aOther.hasMap) {}
+
+  NamecoinNameValue& operator=(const NamecoinNameValue& aOther) {
+    if (this != &aOther) {
+      ip = aOther.ip;
+      ip6 = aOther.ip6;
+      ns = aOther.ns.Clone();
+      tls = aOther.tls.Clone();
+      alias = aOther.alias;
+      translate = aOther.translate;
+      tor = aOther.tor;
+      hasMap = aOther.hasMap;
+    }
+    return *this;
+  }
 };
 
 // ---------------------------------------------------------------------------
@@ -232,6 +269,36 @@ class nsNamecoinResolver final {
    */
   NmcDaneCache* GetDaneCache() const;
 
+  // ---- Global name value cache (Phase 2 DANE hook-in) ---------------------
+  //
+  // After DNS resolution, the resolved NamecoinNameValue (including TLSA
+  // records) is stored here keyed by hostname so that the cert verifier
+  // (SSLServerCertVerification.cpp) can retrieve it during TLS handshake.
+  // Thread-safe via internal static mutex.
+
+  /**
+   * Store a resolved name value for a hostname.
+   * Called from nsHostResolver after successful .bit DNS resolution.
+   *
+   * @param aHostname  The resolved hostname (e.g. "example.bit")
+   * @param aValue     The parsed name value (containing TLSA records etc.)
+   * @param aTTLSeconds  Cache TTL
+   */
+  static void StoreNameValue(const nsACString& aHostname,
+                              const NamecoinNameValue& aValue,
+                              uint32_t aTTLSeconds);
+
+  /**
+   * Retrieve a stored name value for a hostname.
+   * Called from SSLServerCertVerification to get TLSA records.
+   *
+   * @param aHostname  The hostname to look up
+   * @param aValue     Output: the stored name value
+   * @returns true if found and not expired
+   */
+  static bool GetStoredNameValue(const nsACString& aHostname,
+                                  NamecoinNameValue& aValue);
+
   /**
    * Get TLSA records applicable for a specific port.
    * Checks port-specific records (_tcp._<port>) before top-level tls array.
@@ -292,6 +359,20 @@ class nsNamecoinResolver final {
   // Caches cert validation results to avoid repeated crypto operations.
   // Key: "domain:cert_sha256_hex", TTL from network.namecoin.cache_ttl_seconds
   UniquePtr<NmcDaneCache> mDaneCache;
+
+  // ---- Static name-value cache for DANE hook-in ---------------------------
+  struct NameValueCacheEntry {
+    NamecoinNameValue value;
+    mozilla::TimeStamp expiry;
+
+    NameValueCacheEntry() = default;
+    NameValueCacheEntry(const NameValueCacheEntry&) = default;
+    NameValueCacheEntry& operator=(const NameValueCacheEntry&) = default;
+    NameValueCacheEntry(NameValueCacheEntry&&) = default;
+    NameValueCacheEntry& operator=(NameValueCacheEntry&&) = default;
+  };
+  static mozilla::StaticMutex sNameValueCacheMutex;
+  static nsTHashMap<nsCStringHashKey, NameValueCacheEntry> sNameValueCache;
 };
 
 }  // namespace net

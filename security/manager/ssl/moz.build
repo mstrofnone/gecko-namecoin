@@ -212,6 +212,7 @@ LOCAL_INCLUDES += [
     "/dom/base",
     "/dom/crypto",
     "/netwerk/base",
+    "/netwerk/dns",  # Namecoin DANE Phase 2
     "/security/certverifier",
     "/third_party/rust/cose-c/include",
     "/xpcom/base",
