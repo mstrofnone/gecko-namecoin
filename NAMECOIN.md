@@ -6,9 +6,11 @@ This is a patch series against [mozilla-central](https://github.com/mozilla/geck
 
 - **DNS resolution** of `.bit` domains via the Namecoin blockchain (ElectrumX JSON-RPC over WebSocket)
 - **DANE-TLSA certificate validation** so Firefox can establish HTTPS connections to `.bit` sites without traditional Certificate Authorities
-- **Two TLS authentication methods** compatible with [ncgencert](https://github.com/namecoin/ncgencert):
+- **Three TLS authentication methods** compatible with [ncgencert](https://github.com/namecoin/ncgencert) and [IFA-0003](https://github.com/namecoin/proposals/blob/master/ifa-0003.md):
   - **Method 1 (DANE-TA hash):** TLSA record published in the blockchain — standard DANE
   - **Method 2 (Address signature):** Domain owner signs a message with their Namecoin wallet — no TLSA in blockchain needed
+  - **Method 3 (Dehydrated certificate):** Compact cert representation stored directly in the blockchain (IFA-0003 `d8` format)
+- **AIA URL interception** for `aia.x--nmc.bit`: synthesizes intermediate CA data from the URL's `pub=` SPKI parameter without any HTTP fetch
 - **From-scratch secp256k1 ECDSA** because Firefox/NSS does not support this curve (see [Why secp256k1 from scratch?](#why-secp256k1-from-scratch))
 
 ## Table of Contents
@@ -19,6 +21,8 @@ This is a patch series against [mozilla-central](https://github.com/mozilla/geck
   - [How ncgencert Works](#how-ncgencert-works)
   - [Method 1: DANE-TA Hash in Blockchain](#method-1-dane-ta-hash-in-blockchain)
   - [Method 2: Namecoin Address Signature (ncgencert Option 2)](#method-2-namecoin-address-signature-ncgencert-option-2)
+  - [Method 3: Dehydrated Certificate (IFA-0003 d8 format)](#method-3-dehydrated-certificate-ifa-0003-d8-format)
+  - [AIA URL Interception (aia.x--nmc.bit)](#aia-url-interception-aiax--nmcbit)
   - [Decision Flow: Which Method Gets Used?](#decision-flow-which-method-gets-used)
 - [Why secp256k1 from scratch?](#why-secp256k1-from-scratch)
 - [Architecture Diagram](#architecture-diagram)
@@ -199,27 +203,120 @@ SSLServerCertVerificationJob::Run()
   → Dispatch(success)
 ```
 
+### Method 3: Dehydrated Certificate (IFA-0003 d8 format)
+
+**Commit:** [`0a1b7ad`](../../commit/0a1b7ad) (dehydrated cert + AIA interception)
+
+The [IFA-0003](https://github.com/namecoin/proposals/blob/master/ifa-0003.md) proposal defines a compact certificate encoding, called a **dehydrated certificate** (`d8` format), that fits comfortably in a Namecoin blockchain value (~255 bytes of JSON).
+
+Instead of a TLSA record array, the `tls` field can contain an object:
+
+```json
+{
+  "ip": "1.2.3.4",
+  "tls": [
+    {"d8": [1, "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEGm0z...", 4944096, 5154336, 10, "MEUCIQCEkb4Q..."]}
+  ]
+}
+```
+
+The `d8` array contains: `[version=1, pubkeyB64, notBeforeScaled, notAfterScaled, signatureAlgorithm, signatureB64]`
+
+- `pubkeyB64`: Base64-encoded PKIX SubjectPublicKeyInfo (SPKI DER) of the server's public key
+- `notBeforeScaled` / `notAfterScaled`: Validity period in units of 5 minutes (multiply by 300 for Unix seconds)
+- `signatureAlgorithm`: Integer matching Go's `x509.SignatureAlgorithm` (10 = ECDSAWithSHA256)
+- `signatureB64`: Base64-encoded certificate signature (splice-signed)
+
+**Validation in Firefox:**
+
+1. DNS resolution parses the `d8` entry and stores a `NmcDehydratedCert` in the `NamecoinNameValue.dehydratedCerts` array
+2. During TLS, `AuthCertificate` fails → DANE hook fires
+3. `NmcValidateDane()` finds no DANE TLSA records
+4. Falls through to dehydrated cert check:
+   - Extracts server cert's SPKI via `CERT_ExtractPublicKey` + `SECKEY_EncodeDERSubjectPublicKeyInfo`
+   - Decodes each `pubkeyB64` from the blockchain (handles URL-safe base64)
+   - Byte-compares the SPKIs
+5. **Match → connection allowed**
+
+**Trust model:** The blockchain's assertion of the public key is the trust anchor. The server possessing the corresponding private key proves identity. Full cert rehydration (DER reconstruction) is not needed — SPKI comparison is sufficient and cryptographically equivalent.
+
+IFA-0003 also defines an alternate form for classic DANE records wrapped in an object: `{"dane": [usage, selector, matchType, data]}`. This is also handled for forward compatibility.
+
+**Code path:**
+```
+NmcValidateDane()
+  → records empty (no DANE TLSA)
+  → ncgencert sig path tried (no owner address or no sigs found)
+  → dehydratedCerts not empty?
+    → CERT_ExtractPublicKey(aCert) → SECKEY_EncodeDERSubjectPublicKeyInfo
+    → decode each dc.pubkeyB64 → memcmp SPKIs
+    → match → NMC_DANE_OK
+```
+
+### AIA URL Interception (aia.x--nmc.bit)
+
+**Commit:** [`0a1b7ad`](../../commit/0a1b7ad) (dehydrated cert + AIA interception)
+
+When a server is configured with ncgencert and sends **only the EE cert** (not the full `chain.pem`), the EE cert's Authority Information Access (AIA) extension contains a URL pointing to the intermediate CA:
+
+```
+http://aia.x--nmc.bit/aia?pub=<url-safe-base64-SPKI>
+```
+
+The `pub` parameter is the URL-safe base64-encoded SPKI of the intermediate Domain CA.
+
+**The problem:** `aia.x--nmc.bit` is itself a `.bit` domain that doesn't exist on the regular internet. Firefox's standard AIA fetching mechanism tries to make an HTTP request to this URL and fails, leaving the cert chain incomplete and DANE-TA validation unable to find the intermediate's SPKI in the chain.
+
+**The solution:** For DANE-TA (usage=2) records with selector=1 (SPKI matching), `NmcValidateDane` now scans the EE cert's raw DER bytes for the `aia.x--nmc.bit/aia?` string before walking the cert chain. If found:
+
+1. Extracts the `pub=` parameter value (URL-safe base64 SPKI)
+2. Converts from URL-safe to standard base64 and decodes
+3. Applies the TLSA record's `matchType` hash (SHA-256, SHA-512, or exact)
+4. Compares against the TLSA record's data field
+5. **Match → NMC_DANE_OK** — no HTTP fetch required
+
+The SPKI is self-contained in the AIA extension URL itself — the server has already told us the intermediate's public key, embedded right in the cert it sent us.
+
+**Why scan raw DER:** The AIA `caIssuers` URI is stored as an `IA5String` in the cert's DER encoding. Scanning for the known ASCII pattern `aia.x--nmc.bit/aia?` in the cert bytes is reliable, simpler than full AIA extension DER parsing, and specific enough to avoid false matches.
+
+**Code path:**
+```
+NmcValidateDane() → DANE-TA (usage=2, selector=1) record
+  → NmcDaneMatchSingleRecord(rec, aCert) — no direct match
+  → Scan aCert->derCert.data for "aia.x--nmc.bit/aia?"
+  → Found → extract pub= param → base64 decode → SPKI bytes
+  → NmcDaneComputeMatch(aiaSpki, rec.matchType) → computed hash
+  → compare to rec.data → match → NMC_DANE_OK
+```
+
 ### Decision Flow: Which Method Gets Used?
 
 ```
 NmcValidateDane() called
     │
     ├─ TLSA records exist for this port?
-    │   ├─ YES → Method 1 (DANE-TA hash match)
-    │   │   ├─ Match → SUCCESS
+    │   ├─ YES → Method 1 (DANE-TA / DANE-EE hash match)
+    │   │   ├─ Direct cert/SPKI match → SUCCESS
+    │   │   ├─ DANE-TA + AIA URL in EE cert → match pub= SPKI → SUCCESS
+    │   │   ├─ DANE-TA + stapled pubb64 in chain cert → match → SUCCESS
     │   │   └─ No match → HARD FAIL (blockchain says specific cert, this isn't it)
     │   │
-    │   └─ NO → Owner address available?
-    │       ├─ YES → Method 2 (address signature)
-    │       │   ├─ Valid sig → SUCCESS
-    │       │   └─ Invalid/missing sig → HARD FAIL
+    │   └─ NO TLSA records → Try in order:
     │       │
-    │       └─ NO → NMC_DANE_NO_RECORD (fall through to standard error page)
+    │       ├─ Owner address available? (ncgencert sig path)
+    │       │   ├─ Valid sig in chain cert issuer DN → SUCCESS  (Method 2)
+    │       │   └─ Sig present but invalid → HARD FAIL
+    │       │
+    │       ├─ Dehydrated cert(s) in blockchain? (d8 format)
+    │       │   ├─ Server cert SPKI matches pubkeyB64 → SUCCESS  (Method 3)
+    │       │   └─ No match → continue
+    │       │
+    │       └─ No match found → NMC_DANE_NO_RECORD (standard error page)
     │
     └─ (no name value cached) → Standard cert error
 ```
 
-**Important:** If TLSA records exist, Method 1 is always used (even if sigs are also present). Method 2 is only tried when TLSA records are absent.
+**Priority:** If TLSA records exist, Method 1 is always tried first. Methods 2 and 3 are only attempted when no TLSA records are present. Method 2 (address signature) is tried before Method 3 (dehydrated cert).
 
 ## Why secp256k1 from scratch?
 
@@ -273,9 +370,12 @@ Also implemented standalone: **RIPEMD-160**. NSS's `hasht.h` only exposes SHA fa
 │  │ NmcDaneValidator                                      │   │
 │  │ • GetTlsaForPort() — port-specific record lookup     │   │
 │  │ • Method 1: DANE-TA hash match (TLSA records exist)  │   │
-│  │   └─ NmcDaneExtractStapledSpki() → SHA-256 compare   │   │
+│  │   ├─ NmcDaneExtractStapledSpki() → SHA-256 compare   │   │
+│  │   └─ AIA URL interception (aia.x--nmc.bit/aia?pub=)  │   │
 │  │ • Method 2: ncgencert sig (no TLSA, owner address)   │   │
 │  │   └─ Extract sigs from issuer DN → verify signature  │   │
+│  │ • Method 3: dehydrated cert (no TLSA, d8 format)     │   │
+│  │   └─ Compare server SPKI to blockchain pubkeyB64     │   │
 │  └───────────────┬───────────────────────────────────────┘   │
 │                  │ (Method 2 only)                            │
 │                  ▼                                            │
@@ -296,10 +396,10 @@ Also implemented standalone: **RIPEMD-160**. NSS's `hasht.h` only exposes SHA fa
 
 | File | Lines | Role |
 |------|-------|------|
-| `netwerk/dns/nsNamecoinResolver.cpp` | ~2080 | Main resolver: ElectrumX WebSocket pool (NSPR raw sockets), JSON parser, NAME_UPDATE decoder, scripthash computation, `DecodeNameScriptWithAddress`, static name-value cache |
-| `netwerk/dns/nsNamecoinResolver.h` | | Data types (`NamecoinTLSARecord`, `NamecoinNameValue`, `NamecoinResolveResult`), class declaration, cache types |
+| `netwerk/dns/nsNamecoinResolver.cpp` | ~2261 | Main resolver: ElectrumX WebSocket pool (NSPR raw sockets), JSON parser, NAME_UPDATE decoder, scripthash computation, `DecodeNameScriptWithAddress`, static name-value cache; IFA-0003 `d8`/`dane` object tls entry parsing |
+| `netwerk/dns/nsNamecoinResolver.h` | | Data types (`NamecoinTLSARecord`, `NmcDehydratedCert`, `NamecoinNameValue`, `NamecoinResolveResult`), class declaration, cache types |
 | `netwerk/dns/nsNamecoinErrors.h` | | `NMC_LOG`/`NMC_ERR` macros, `HexEncode`/`HexDecode`, opcodes |
-| `netwerk/dns/NmcDaneValidator.cpp` | ~880 | DANE-TLSA validation: `NmcValidateDane()`, DANE-TA chain walk, stapled SPKI extraction, ncgencert sig path integration, validation result cache |
+| `netwerk/dns/NmcDaneValidator.cpp` | ~1020 | DANE-TLSA validation: `NmcValidateDane()`, DANE-TA chain walk, stapled SPKI extraction, ncgencert sig path, dehydrated cert SPKI comparison, AIA URL interception, validation result cache |
 | `netwerk/dns/NmcDaneValidator.h` | | `NmcDaneValidateResult` enum, `NmcDaneCache`, function declarations |
 | `netwerk/dns/NmcSigVerify.cpp` | ~780 | secp256k1 ECDSA from scratch: U256 bigint, EC point operations, `ecdsa_recover`, RIPEMD-160, Base58Check, Bitcoin message hashing |
 | `netwerk/dns/NmcSigVerify.h` | | `NmcVerifyMessageSignature()`, `NmcRecoverSigningAddress()` |
@@ -337,6 +437,11 @@ Commits are ordered so that each TLS method can be reviewed independently:
 |--------|-------------|
 | [`f5b6d6d`](../../commit/f5b6d6d) | **secp256k1 ECDSA** from scratch + RIPEMD-160 + Base58Check + owner address extraction from NAME_UPDATE |
 | [`d31f7db`](../../commit/d31f7db) | **ncgencert Option 2 integration**: wire sig path into NmcDaneValidator (no-TLSA fallback) |
+
+### Method 3 + AIA Interception
+| Commit | Description |
+|--------|-------------|
+| [`0a1b7ad`](../../commit/0a1b7ad) | **Dehydrated cert** (IFA-0003 `d8`) SPKI validation + **AIA URL interception** for `aia.x--nmc.bit` |
 
 ### Bug Fixes & Misc
 | Commit | Description |
@@ -383,6 +488,8 @@ All preferences are in `about:config`:
 | `network.namecoin.connection_timeout_ms` | `10000` | ElectrumX connection timeout |
 | `network.namecoin.require_tls` | `true` | Require HTTPS when TLSA records exist |
 
+**TLS authentication methods enabled by default when `network.namecoin.enabled=true`:** All three methods (DANE-TA hash, address signature, dehydrated cert) are active. No per-method preference is needed.
+
 ## Security Model
 
 | Aspect | Trust basis |
@@ -418,17 +525,18 @@ These are hard-won lessons from 9 crashes across 15 development sessions:
 
 ## Known Limitations
 
-- **Dehydrated certificates**: Namecoin supports compact cert representations stored in the blockchain that get "rehydrated" into full X.509 certs. Not yet implemented.
-- **AIA fetching**: When a server only sends the EE cert, Firefox may try to fetch the intermediate via `http://aia.x--nmc.bit/aia?...` — which is itself a `.bit` domain. Not yet handled.
 - **Constant-time crypto**: secp256k1 scalar multiplication uses double-and-add (timing leaks). Acceptable for verification only.
 - **UI indicators**: The lock icon doesn't yet indicate "Namecoin DANE validated" — it shows as a normal connection or cert error.
 - **ElectrumX consensus**: Currently uses single-server queries with failover. Multi-server consensus verification not yet implemented.
+- **Dehydrated cert full rehydration**: Validation via SPKI comparison is used (sufficient for security). Full DER rehydration (deterministic serial, extensions, splice-signed cert) is not yet implemented — needed only if integration with NSS's standard cert path builder is desired.
+- **AIA protocol handler**: AIA interception currently handles the DANE-TA SPKI match path inline. A full protocol handler for `aia.x--nmc.bit` (returning a synthesized DER cert over HTTP) would make Firefox's built-in AIA fetching work transparently.
 
 ## References
 
 - [ncgencert](https://github.com/namecoin/ncgencert) — Generate Namecoin TLS certificates
 - [RFC 6698](https://tools.ietf.org/html/rfc6698) — DANE-TLSA protocol
 - [Namecoin d/ namespace spec](https://wiki.namecoin.org/Domain_Name_Specification)
-- [Namecoin dehydrated certificates](https://github.com/namecoin/proposals/blob/master/ifa-0003.md)
+- [IFA-0003: Dehydrated TLS Certificates](https://github.com/namecoin/proposals/blob/master/ifa-0003.md)
+- [ncdns certdehydrate.go](https://github.com/namecoin/ncdns/blob/master/certdehydrate/certdehydrate.go) — Reference implementation
 - [secp256k1 curve parameters](https://www.secg.org/sec2-v2.pdf) — SEC 2, section 2.4.1
 - [Bitcoin signmessage format](https://bitcoin.stackexchange.com/questions/3337/what-are-the-parts-of-a-bitcoin-transaction-input-script)
