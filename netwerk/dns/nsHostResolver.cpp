@@ -1255,7 +1255,8 @@ nsresult nsHostResolver::NameLookup(nsHostRecord* rec,
             // SSLServerCertVerification can retrieve it for DANE validation
             // during the TLS handshake (Phase 2 hook-in).
             nsNamecoinResolver::StoreNameValue(
-                hostCopy, nmcResult.nameValue, nmcResult.ttlSeconds);
+                hostCopy, nmcResult.nameValue, nmcResult.ownerAddress,
+                nmcResult.ttlSeconds);
 
             CompleteLookupLocked(rec, NS_OK, ai, rec->pb, rec->originSuffix,
                                  TRRSkippedReason::TRR_DISABLED_FLAG, nullptr,

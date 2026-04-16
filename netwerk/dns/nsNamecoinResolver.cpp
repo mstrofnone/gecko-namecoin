@@ -304,6 +304,144 @@ bool nsNamecoinResolver::DecodeNameScript(const nsACString& aScriptHex,
 }
 
 // ---------------------------------------------------------------------------
+// DecodeNameScriptAddress — extract the owner address from a NAME_UPDATE script
+// ---------------------------------------------------------------------------
+
+// Base58 alphabet for Namecoin address encoding
+static const char kNmcBase58[] =
+  "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+static void NmcBase58EncodeAddress(const uint8_t* payload, size_t len, nsACString& out) {
+  size_t zeros = 0;
+  while (zeros < len && payload[zeros] == 0) zeros++;
+
+  nsTArray<uint8_t> digits;
+  for (size_t i = 0; i < len; i++) {
+    int carry = payload[i];
+    for (size_t j = 0; j < digits.Length(); j++) {
+      carry += 256 * (int)digits[j];
+      digits[j] = (uint8_t)(carry % 58);
+      carry /= 58;
+    }
+    while (carry > 0) {
+      digits.AppendElement((uint8_t)(carry % 58));
+      carry /= 58;
+    }
+  }
+  out.Truncate();
+  for (size_t i = 0; i < zeros; i++) out.Append('1');
+  for (int i = (int)digits.Length() - 1; i >= 0; i--) {
+    out.Append(kNmcBase58[digits[i]]);
+  }
+}
+
+/**
+ * Extract the Namecoin owner address from a NAME_UPDATE script.
+ *
+ * After the name/value push data and OP_2DROP/OP_DROP, the remaining bytes
+ * are the standard scriptPubKey (usually P2PKH or P2WPKH).
+ *
+ * P2PKH: OP_DUP(76) OP_HASH160(a9) 14 <20-byte-hash> OP_EQUALVERIFY(88) OP_CHECKSIG(ac)
+ * P2SH:  OP_HASH160(a9) 14 <20-byte-hash> OP_EQUAL(87)
+ * P2WPKH: OP_0(00) 14 <20-byte-hash>  (bech32, not base58)
+ *
+ * Returns the Base58Check-encoded Namecoin address.
+ */
+static bool DecodeScriptToNmcAddress(const nsTArray<uint8_t>& bytes, size_t offset,
+                                      nsACString& aAddress) {
+  size_t len = bytes.Length();
+  if (offset >= len) return false;
+
+  // Skip OP_2DROP (0x6d) and OP_DROP (0x75) if present
+  size_t i = offset;
+  if (i < len && bytes[i] == 0x6d) i++;  // OP_2DROP
+  if (i < len && bytes[i] == 0x75) i++;  // OP_DROP
+
+  if (i + 25 <= len &&
+      bytes[i] == 0x76 && bytes[i+1] == 0xa9 && bytes[i+2] == 0x14 &&
+      bytes[i+23] == 0x88 && bytes[i+24] == 0xac) {
+    // P2PKH: version 0x34 (Namecoin mainnet)
+    const uint8_t* hash160 = bytes.Elements() + i + 3;
+    uint8_t versioned[21];
+    versioned[0] = 0x34;  // Namecoin mainnet P2PKH version
+    memcpy(versioned + 1, hash160, 20);
+
+    // Checksum: SHA256d first 4 bytes
+    uint8_t tmp[32], checksum[32];
+    HASH_HashBuf(HASH_AlgSHA256, tmp, versioned, 21);
+    HASH_HashBuf(HASH_AlgSHA256, checksum, tmp, 32);
+
+    uint8_t payload[25];
+    memcpy(payload, versioned, 21);
+    memcpy(payload + 21, checksum, 4);
+
+    NmcBase58EncodeAddress(payload, 25, aAddress);
+    return true;
+  } else if (i + 23 <= len &&
+             bytes[i] == 0xa9 && bytes[i+1] == 0x14 && bytes[i+22] == 0x87) {
+    // P2SH: version 0x0d (Namecoin mainnet P2SH)
+    const uint8_t* hash160 = bytes.Elements() + i + 2;
+    uint8_t versioned[21];
+    versioned[0] = 0x0d;
+    memcpy(versioned + 1, hash160, 20);
+
+    uint8_t tmp[32], checksum[32];
+    HASH_HashBuf(HASH_AlgSHA256, tmp, versioned, 21);
+    HASH_HashBuf(HASH_AlgSHA256, checksum, tmp, 32);
+
+    uint8_t payload[25];
+    memcpy(payload, versioned, 21);
+    memcpy(payload + 21, checksum, 4);
+
+    NmcBase58EncodeAddress(payload, 25, aAddress);
+    return true;
+  }
+
+  return false;  // unrecognized script type
+}
+
+// Extended decode: also extracts owner address from the trailing scriptPubKey.
+bool DecodeNameScriptWithAddress(const nsACString& aScriptHex,
+                                  nsACString& aName,
+                                  nsACString& aValue,
+                                  nsACString& aAddress) {
+  nsTArray<uint8_t> bytes;
+  if (!HexDecode(aScriptHex, bytes)) return false;
+  if (bytes.IsEmpty() || bytes[0] != kOpNameUpdate) return false;
+
+  size_t i = 1;
+  size_t len = bytes.Length();
+
+  auto readPushdata = [&](nsTArray<uint8_t>& out, size_t& pos) -> bool {
+    if (pos >= len) return false;
+    uint8_t opcode = bytes[pos++];
+    size_t datalen = 0;
+    if (opcode == 0x00) { out.Clear(); return true; }
+    else if (opcode >= 0x01 && opcode <= 0x4b) datalen = opcode;
+    else if (opcode == kOpPushData1) { if (pos >= len) return false; datalen = bytes[pos++]; }
+    else if (opcode == kOpPushData2) {
+      if (pos + 1 >= len) return false;
+      datalen = (size_t)bytes[pos] | ((size_t)bytes[pos+1] << 8); pos += 2;
+    } else return false;
+    if (pos + datalen > len) return false;
+    out.ReplaceElementsAt(0, out.Length(), bytes.Elements() + pos, datalen);
+    pos += datalen;
+    return true;
+  };
+
+  nsTArray<uint8_t> nameData, valueData;
+  if (!readPushdata(nameData, i)) return false;
+  if (!readPushdata(valueData, i)) return false;
+
+  aName.Assign(reinterpret_cast<const char*>(nameData.Elements()), nameData.Length());
+  aValue.Assign(reinterpret_cast<const char*>(valueData.Elements()), valueData.Length());
+
+  // Try to decode owner address from remaining bytes
+  DecodeScriptToNmcAddress(bytes, i, aAddress);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // nsNamecoinResolver::IsNamecoinHost (static)
 // ---------------------------------------------------------------------------
 
@@ -1838,11 +1976,16 @@ nsresult nsNamecoinResolver::ResolveInternal(const nsACString& aHostname,
       int32_t end = scriptHex.FindChar('"');
       if (end > 0) {
         scriptHex.Truncate(end);
-        nsAutoCString decodedName, decodedValue;
-        if (DecodeNameScript(scriptHex, decodedName, decodedValue)) {
+        nsAutoCString decodedName, decodedValue, ownerAddr;
+        if (DecodeNameScriptWithAddress(scriptHex, decodedName, decodedValue, ownerAddr)) {
           // Check name matches what we looked up
           if (decodedName.Equals(namePath)) {
             nameValue = decodedValue;
+            if (!ownerAddr.IsEmpty()) {
+              aResult.ownerAddress = ownerAddr;
+              NMC_LOG("ResolveInternal: owner address for %s: %s",
+                      namePath.get(), ownerAddr.get());
+            }
             NMC_LOG("ResolveInternal: decoded value for %s: %s",
                     namePath.get(), nameValue.get());
             break;
@@ -2027,11 +2170,13 @@ int32_t nsNamecoinResolver::TestConnectivity() {
 /* static */ void nsNamecoinResolver::StoreNameValue(
     const nsACString& aHostname,
     const NamecoinNameValue& aValue,
+    const nsACString& aOwnerAddress,
     uint32_t aTTLSeconds) {
   mozilla::StaticMutexAutoLock lock(sNameValueCacheMutex);
 
   NameValueCacheEntry entry;
   entry.value = aValue;
+  entry.ownerAddress = aOwnerAddress;
   entry.expiry = mozilla::TimeStamp::Now() +
                  mozilla::TimeDuration::FromSeconds((double)aTTLSeconds);
 
@@ -2039,15 +2184,17 @@ int32_t nsNamecoinResolver::TestConnectivity() {
   ToLowerCase(key);
   sNameValueCache.InsertOrUpdate(key, std::move(entry));
 
-  NMC_LOG("StoreNameValue: cached name value for %s (ttl=%us, tlsa=%zu)",
+  NMC_LOG("StoreNameValue: cached name value for %s (ttl=%us, tlsa=%zu, owner=%s)",
            nsPromiseFlatCString(aHostname).get(),
            aTTLSeconds,
-           aValue.tls.Length());
+           aValue.tls.Length(),
+           nsPromiseFlatCString(aOwnerAddress).get());
 }
 
 /* static */ bool nsNamecoinResolver::GetStoredNameValue(
     const nsACString& aHostname,
-    NamecoinNameValue& aValue) {
+    NamecoinNameValue& aValue,
+    nsACString& aOwnerAddress) {
   mozilla::StaticMutexAutoLock lock(sNameValueCacheMutex);
 
   nsCString key(aHostname);
@@ -2066,9 +2213,11 @@ int32_t nsNamecoinResolver::TestConnectivity() {
   }
 
   aValue = entry->value;
-  NMC_LOG("GetStoredNameValue: found %zu TLSA records for %s",
+  aOwnerAddress = entry->ownerAddress;
+  NMC_LOG("GetStoredNameValue: found %zu TLSA records for %s (owner=%s)",
            aValue.tls.Length(),
-           nsPromiseFlatCString(aHostname).get());
+           nsPromiseFlatCString(aHostname).get(),
+           nsPromiseFlatCString(aOwnerAddress).get());
   return true;
 }
 

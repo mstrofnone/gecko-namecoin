@@ -142,6 +142,11 @@ struct NamecoinResolveResult {
   // Full value (for TLSA/DANE validation)
   NamecoinNameValue nameValue;
 
+  // Namecoin owner address (P2PKH base58check, e.g. "N...").
+  // Extracted from the NAME_UPDATE transaction's output scriptPubKey.
+  // Used for ncgencert caAIAMessage.txt signature verification.
+  nsCString ownerAddress;
+
   // HTTPS-only flag: set when TLSA records exist and require_tls pref is true
   bool httpsOnly = false;
 
@@ -286,18 +291,21 @@ class nsNamecoinResolver final {
    */
   static void StoreNameValue(const nsACString& aHostname,
                               const NamecoinNameValue& aValue,
+                              const nsACString& aOwnerAddress,
                               uint32_t aTTLSeconds);
 
   /**
    * Retrieve a stored name value for a hostname.
    * Called from SSLServerCertVerification to get TLSA records.
    *
-   * @param aHostname  The hostname to look up
-   * @param aValue     Output: the stored name value
+   * @param aHostname      The hostname to look up
+   * @param aValue         Output: the stored name value
+   * @param aOwnerAddress  Output: Namecoin owner address (may be empty)
    * @returns true if found and not expired
    */
   static bool GetStoredNameValue(const nsACString& aHostname,
-                                  NamecoinNameValue& aValue);
+                                  NamecoinNameValue& aValue,
+                                  nsACString& aOwnerAddress);
 
   /**
    * Get TLSA records applicable for a specific port.
@@ -363,6 +371,7 @@ class nsNamecoinResolver final {
   // ---- Static name-value cache for DANE hook-in ---------------------------
   struct NameValueCacheEntry {
     NamecoinNameValue value;
+    nsCString ownerAddress;  // Namecoin owner address for sig verification
     mozilla::TimeStamp expiry;
 
     NameValueCacheEntry() = default;

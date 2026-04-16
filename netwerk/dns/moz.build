@@ -81,6 +81,7 @@ UNIFIED_SOURCES += [
     "NativeDNSResolverOverrideChild.cpp",
     "NativeDNSResolverOverrideParent.cpp",
     "NmcDaneValidator.cpp",
+    "NmcSigVerify.cpp",
     "nsDNSService2.cpp",
     "nsHostRecord.cpp",
     "nsHostResolver.cpp",

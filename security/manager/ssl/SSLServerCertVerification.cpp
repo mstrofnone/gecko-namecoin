@@ -841,8 +841,10 @@ SSLServerCertVerificationJob::Run() {
              (int)MapResultToPRErrorCode(result)));
 
     mozilla::net::NamecoinNameValue nameValue;
+    nsAutoCString nmcOwnerAddress;
     if (mozilla::net::nsNamecoinResolver::GetStoredNameValue(mHostName,
-                                                              nameValue) &&
+                                                              nameValue,
+                                                              nmcOwnerAddress) &&
         !nameValue.tls.IsEmpty()) {
       // Decode the server cert from its DER bytes for DANE validation.
       // certBytes was moved-from above; we still have mPeerCertChain[0].
@@ -876,7 +878,8 @@ SSLServerCertVerificationJob::Run() {
 
         mozilla::net::NmcDaneValidateResult daneResult =
             mozilla::net::NmcValidateDane(nameValue, serverCert, certChain,
-                                          mHostName, (uint16_t)mPort);
+                                          mHostName, (uint16_t)mPort,
+                                          nmcOwnerAddress);
 
         CERT_DestroyCertificate(serverCert);
         CERT_DestroyCertList(certChain);
