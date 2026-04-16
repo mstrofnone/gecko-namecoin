@@ -1587,11 +1587,47 @@ static void NmcPopulateNameValue(const NmcJsonValue& obj, NamecoinNameValue& out
     }
   }
 
-  // tls: array of [usage, selector, matchType, data] tuples (Phase 2 consumes this)
+  // tls: array of entries, each either:
+  //   - Classic DANE: [usage, selector, matchType, data]
+  //   - Dehydrated cert: {"d8": [1, pubkeyB64, notBefore, notAfter, sigAlgo, sigB64]}
+  //   - Object-wrapped DANE: {"dane": [usage, selector, matchType, data]}
   {
     const NmcJsonValue* v = obj.Get("tls");
     if (v && v->IsArray()) {
       for (const auto& entry : v->arrayVal) {
+        if (entry.IsObject()) {
+          // Check for d8 (dehydrated cert) format
+          const NmcJsonValue* d8 = entry.Get("d8");
+          if (d8 && d8->IsArray() && d8->arrayVal.Length() >= 6) {
+            const auto& a = d8->arrayVal;
+            if (a[0].IsNumber() && (int)a[0].numVal == 1 &&
+                a[1].IsString() && a[2].IsNumber() &&
+                a[3].IsNumber() && a[4].IsNumber() && a[5].IsString()) {
+              NmcDehydratedCert dc;
+              dc.pubkeyB64       = a[1].strVal;
+              dc.notBeforeScaled = (int64_t)a[2].numVal;
+              dc.notAfterScaled  = (int64_t)a[3].numVal;
+              dc.sigAlgo         = (int64_t)a[4].numVal;
+              dc.sigB64          = a[5].strVal;
+              out.dehydratedCerts.AppendElement(std::move(dc));
+            }
+          }
+          // Check for object-wrapped classic DANE: {"dane": [usage, sel, matchType, data]}
+          const NmcJsonValue* dane = entry.Get("dane");
+          if (dane && dane->IsArray() && dane->arrayVal.Length() >= 4) {
+            const auto& a = dane->arrayVal;
+            if (a[0].IsNumber() && a[1].IsNumber() && a[2].IsNumber() && a[3].IsString()) {
+              NamecoinTLSARecord rec;
+              rec.usage     = (uint8_t)(int)a[0].numVal;
+              rec.selector  = (uint8_t)(int)a[1].numVal;
+              rec.matchType = (uint8_t)(int)a[2].numVal;
+              rec.data      = a[3].strVal;
+              out.tls.AppendElement(std::move(rec));
+            }
+          }
+          continue;  // handled as object, skip array check below
+        }
+        // Classic array format: [usage, selector, matchType, data]
         if (!entry.IsArray() || entry.arrayVal.Length() < 4) continue;
         const auto& a = entry.arrayVal;
         if (!a[0].IsNumber() || !a[1].IsNumber() || !a[2].IsNumber()) continue;

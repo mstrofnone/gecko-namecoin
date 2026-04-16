@@ -79,11 +79,28 @@ struct NamecoinTLSARecord {
   NamecoinTLSARecord& operator=(NamecoinTLSARecord&&) = default;
 };
 
+// Dehydrated certificate (IFA-0003 d8 format) stored in blockchain tls array.
+// Rehydrated by comparing the server cert's SPKI against pubkeyB64.
+struct NmcDehydratedCert {
+  nsCString pubkeyB64;      // base64 PKIX public key (SPKI DER)
+  int64_t notBeforeScaled;  // Unix seconds / 300
+  int64_t notAfterScaled;   // Unix seconds / 300
+  int64_t sigAlgo;          // 10 = ECDSAWithSHA256
+  nsCString sigB64;         // base64 signature
+
+  NmcDehydratedCert() = default;
+  NmcDehydratedCert(const NmcDehydratedCert&) = default;
+  NmcDehydratedCert& operator=(const NmcDehydratedCert&) = default;
+  NmcDehydratedCert(NmcDehydratedCert&&) = default;
+  NmcDehydratedCert& operator=(NmcDehydratedCert&&) = default;
+};
+
 struct NamecoinNameValue {
   nsCString ip;         // IPv4 (A record)
   nsCString ip6;        // IPv6 (AAAA record)
   nsTArray<nsCString> ns;  // NS delegation targets
   nsTArray<NamecoinTLSARecord> tls;  // DANE-TLSA records
+  nsTArray<NmcDehydratedCert> dehydratedCerts;  // d8 format entries
   nsCString alias;      // CNAME-like, follow chain
   nsCString translate;  // Map to standard domain
   nsCString tor;        // .onion address
@@ -102,6 +119,7 @@ struct NamecoinNameValue {
         ip6(aOther.ip6),
         ns(aOther.ns.Clone()),
         tls(aOther.tls.Clone()),
+        dehydratedCerts(aOther.dehydratedCerts.Clone()),
         alias(aOther.alias),
         translate(aOther.translate),
         tor(aOther.tor),
@@ -113,6 +131,7 @@ struct NamecoinNameValue {
       ip6 = aOther.ip6;
       ns = aOther.ns.Clone();
       tls = aOther.tls.Clone();
+      dehydratedCerts = aOther.dehydratedCerts.Clone();
       alias = aOther.alias;
       translate = aOther.translate;
       tor = aOther.tor;

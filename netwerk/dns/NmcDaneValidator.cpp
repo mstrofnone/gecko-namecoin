@@ -763,6 +763,49 @@ NmcDaneValidateResult NmcValidateDane(
       }
     }
 
+    // -----------------------------------------------------------------------
+    // Dehydrated cert check (IFA-0003 d8 format):
+    // If the blockchain has a dehydrated cert, compare its pubkeyB64 SPKI
+    // against the server cert's SPKI. If they match, trust the cert.
+    // -----------------------------------------------------------------------
+    if (!aNameValue.dehydratedCerts.IsEmpty()) {
+      DANE_LOG("NmcValidateDane: checking %u dehydrated cert(s)",
+               (unsigned)aNameValue.dehydratedCerts.Length());
+
+      SECKEYPublicKey* serverPk = CERT_ExtractPublicKey(aCert);
+      SECItem* serverSpki = serverPk ? SECKEY_EncodeDERSubjectPublicKeyInfo(serverPk) : nullptr;
+      if (serverPk) SECKEY_DestroyPublicKey(serverPk);
+
+      if (serverSpki && serverSpki->data && serverSpki->len > 0) {
+        for (const auto& dc : aNameValue.dehydratedCerts) {
+          // Decode the pubkeyB64 from the blockchain
+          nsAutoCString pubB64(dc.pubkeyB64);
+          // Handle URL-safe base64
+          pubB64.ReplaceChar('-', '+');
+          pubB64.ReplaceChar('_', '/');
+          while (pubB64.Length() % 4 != 0) {
+            pubB64.Append('=');
+          }
+          nsAutoCString pubDer;
+          if (NS_FAILED(mozilla::Base64Decode(pubB64, pubDer))) {
+            DANE_ERR("NmcValidateDane: d8 pubkeyB64 base64 decode failed");
+            continue;
+          }
+
+          if (serverSpki->len == (uint32_t)pubDer.Length() &&
+              memcmp(serverSpki->data, pubDer.BeginReading(), serverSpki->len) == 0) {
+            SECITEM_FreeItem(serverSpki, PR_TRUE);
+            DANE_LOG("NmcValidateDane: dehydrated cert SPKI match → NMC_DANE_OK");
+            return NmcDaneValidateResult::NMC_DANE_OK;
+          }
+        }
+        SECITEM_FreeItem(serverSpki, PR_TRUE);
+      } else {
+        if (serverSpki) SECITEM_FreeItem(serverSpki, PR_TRUE);
+        DANE_ERR("NmcValidateDane: failed to extract server cert SPKI");
+      }
+    }
+
     DANE_LOG("NmcValidateDane: no TLSA records → NMC_DANE_NO_RECORD");
     return NmcDaneValidateResult::NMC_DANE_NO_RECORD;
   }
@@ -793,6 +836,101 @@ NmcDaneValidateResult NmcValidateDane(
         if (NmcDaneMatchSingleRecord(rec, aCert)) {
           DANE_LOG("NmcValidateDane: DANE-TA match on EE cert → NMC_DANE_OK");
           return NmcDaneValidateResult::NMC_DANE_OK;
+        }
+
+        // AIA fallback: if rec.selector == 1 (SPKI match), check whether the
+        // EE cert's AIA extension contains an x--nmc URL encoding the TA's SPKI.
+        // This handles servers that send only the EE cert (not the full chain).
+        // Format: http://aia.x--nmc.bit/aia?pub=<url-safe-base64-SPKI>
+        if (rec.selector == 1 && aCert && aCert->derCert.data) {
+          // Search the EE cert's raw DER for the known AIA URL pattern.
+          // The URL is embedded as an IA5String in the AIA extension —
+          // searching the DER bytes directly is a reliable shortcut.
+          static const char kAIAPrefix[] = "aia.x--nmc.bit/aia?";
+          static const char kPubParam[] = "pub=";
+          const uint8_t* certData = aCert->derCert.data;
+          uint32_t certLen = aCert->derCert.len;
+          // Find the AIA URL by scanning for the known hostname string
+          const char* found = nullptr;
+          const char* needle = kAIAPrefix;
+          size_t needleLen = sizeof(kAIAPrefix) - 1;
+          for (uint32_t i = 0; i + needleLen <= certLen; i++) {
+            if (memcmp(certData + i, needle, needleLen) == 0) {
+              // Scan back to find 'http://' or 'https://'
+              found = reinterpret_cast<const char*>(certData + i);
+              break;
+            }
+          }
+          if (found) {
+            // Extract from the aia.x--nmc.bit/aia? point onwards
+            const char* urlData = found;
+            size_t maxLen = certLen - (found - reinterpret_cast<const char*>(certData));
+            // Find pub= parameter
+            const char* pubStart = nullptr;
+            for (size_t j = 0; j + sizeof(kPubParam) - 1 < maxLen; j++) {
+              if (memcmp(urlData + j, kPubParam, sizeof(kPubParam) - 1) == 0) {
+                pubStart = urlData + j + sizeof(kPubParam) - 1;
+                break;
+              }
+            }
+            if (pubStart) {
+              // URL-safe base64 chars: A-Z a-z 0-9 - _
+              const char* pubEnd = pubStart;
+              size_t remaining = maxLen - (pubStart - urlData);
+              while (pubEnd - pubStart < (ptrdiff_t)remaining) {
+                char c = *pubEnd;
+                if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                    (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '=') {
+                  pubEnd++;
+                } else {
+                  break;
+                }
+              }
+              if (pubEnd > pubStart) {
+                nsAutoCString pubB64url(pubStart, pubEnd - pubStart);
+                nsAutoCString pubB64(pubB64url);
+                pubB64.ReplaceChar('-', '+');
+                pubB64.ReplaceChar('_', '/');
+                while (pubB64.Length() % 4 != 0) pubB64.Append('=');
+                nsAutoCString aiaSpkiDer;
+                if (NS_SUCCEEDED(mozilla::Base64Decode(pubB64, aiaSpkiDer))) {
+                  // We have the TA's SPKI bytes from the AIA URL.
+                  // Compute the match against this TLSA record.
+                  nsTArray<uint8_t> aiaSpkiVec;
+                  aiaSpkiVec.SetLength(aiaSpkiDer.Length());
+                  memcpy(aiaSpkiVec.Elements(), aiaSpkiDer.BeginReading(), aiaSpkiDer.Length());
+
+                  nsTArray<uint8_t> computed;
+                  if (NS_SUCCEEDED(NmcDaneComputeMatch(aiaSpkiVec, rec.matchType, computed))) {
+                    nsTArray<uint8_t> recordData;
+                    bool decoded = DaneHexDecode(rec.data, recordData);
+                    if (!decoded) {
+                      nsAutoCString b64dec;
+                      if (NS_SUCCEEDED(mozilla::Base64Decode(rec.data, b64dec))) {
+                        recordData.SetLength(b64dec.Length());
+                        memcpy(recordData.Elements(), b64dec.BeginReading(), b64dec.Length());
+                        decoded = true;
+                      }
+                    }
+                    if (decoded && computed.Length() == recordData.Length()) {
+                      uint8_t diff = 0;
+                      for (size_t k = 0; k < computed.Length(); k++) {
+                        diff |= computed[k] ^ recordData[k];
+                      }
+                      if (diff == 0) {
+                        DANE_LOG("NmcValidateDane: DANE-TA match via AIA URL "
+                                 "pub= SPKI → NMC_DANE_OK");
+                        return NmcDaneValidateResult::NMC_DANE_OK;
+                      } else {
+                        DANE_LOG("NmcValidateDane: AIA URL SPKI found but "
+                                 "didn't match TLSA record");
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
         }
 
         // Walk the chain if available
