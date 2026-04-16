@@ -167,7 +167,8 @@ NmcDaneValidateResult NmcValidateDane(
     CERTCertificate* aCert,
     CERTCertList* aCertChain,
     const nsACString& aHost,
-    uint16_t aPort);
+    uint16_t aPort,
+    const nsACString& aOwnerAddress = nsCString());
 
 // ---------------------------------------------------------------------------
 // TLSA record lookup helpers

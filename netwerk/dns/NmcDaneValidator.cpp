@@ -29,6 +29,7 @@
  */
 
 #include "NmcDaneValidator.h"
+#include "NmcSigVerify.h"
 #include "nsNamecoinResolver.h"
 #include "nsNamecoinErrors.h"
 
@@ -595,9 +596,11 @@ NmcDaneValidateResult NmcValidateDane(
     CERTCertificate* aCert,
     CERTCertList* aCertChain,
     const nsACString& aHost,
-    uint16_t aPort) {
-  DANE_LOG("NmcValidateDane: host=%s port=%u",
-           nsPromiseFlatCString(aHost).get(), (unsigned)aPort);
+    uint16_t aPort,
+    const nsACString& aOwnerAddress) {
+  DANE_LOG("NmcValidateDane: host=%s port=%u owner=%s",
+           nsPromiseFlatCString(aHost).get(), (unsigned)aPort,
+           nsPromiseFlatCString(aOwnerAddress).get());
 
   if (!aCert) {
     DANE_ERR("NmcValidateDane: null server certificate");
@@ -609,6 +612,157 @@ NmcDaneValidateResult NmcValidateDane(
   GetTlsaForPort(aNameValue, aPort, records);
 
   if (records.IsEmpty()) {
+    // -----------------------------------------------------------------------
+    // ncgencert Option 2 (no TLSA in blockchain): Try to validate using
+    // Namecoin address signatures stapled in the chain cert.
+    //
+    // When the server uses ncgencert's AIA mode, the chain cert (Domain CA)
+    // has the AIA Parent CA's SPKI in its issuer serialNumber along with
+    // a "sigs" field containing a Namecoin address signature over:
+    //   "Namecoin X.509 Stapled Certification: {address, domain, x509pub}"
+    //
+    // This proves the domain owner authorized that CA key, without needing
+    // a TLSA record in the blockchain.
+    // -----------------------------------------------------------------------
+    if (!aOwnerAddress.IsEmpty() && aCertChain) {
+      DANE_LOG("NmcValidateDane: no TLSA records, trying ncgencert sig path"
+               " (owner=%s)", nsPromiseFlatCString(aOwnerAddress).get());
+
+      CERTCertListNode* node = CERT_LIST_HEAD(aCertChain);
+      while (!CERT_LIST_END(node, aCertChain)) {
+        CERTCertificate* chainCert = node->cert;
+        if (chainCert) {
+          nsTArray<uint8_t> stapledSpki;
+          nsAutoCString serialStr;
+
+          // Extract issuer serialNumber (same logic as NmcDaneExtractStapledSpki)
+          CERTRDN** rdns = chainCert->issuer.rdns;
+          if (rdns) {
+            bool found = false;
+            for (CERTRDN** rdnp = rdns; *rdnp && !found; ++rdnp) {
+              CERTAVA** avas = (*rdnp)->avas;
+              if (!avas) continue;
+              for (CERTAVA** avap = avas; *avap && !found; ++avap) {
+                CERTAVA* ava = *avap;
+                if (SECOID_FindOIDTag(&ava->type) == SEC_OID_AVA_SERIAL_NUMBER) {
+                  SECItem* val = CERT_DecodeAVAValue(&ava->value);
+                  if (val && val->data && val->len > 0) {
+                    serialStr.Assign(reinterpret_cast<const char*>(val->data),
+                                     (uint32_t)val->len);
+                    found = true;
+                  }
+                  if (val) SECITEM_FreeItem(val, PR_TRUE);
+                }
+              }
+            }
+          }
+
+          if (!serialStr.IsEmpty()) {
+            // Extract pubb64 and sigs from the stapled JSON
+            static const char kPubb64Key[] = "\"pubb64\":\"";
+            static const char kSigsKey[] = "\"sigs\":{";
+            int32_t pubb64Pos = serialStr.Find(kPubb64Key);
+            int32_t sigsPos   = serialStr.Find(kSigsKey);
+
+            if (pubb64Pos >= 0 && sigsPos >= 0) {
+              // Extract pubb64 value
+              int32_t pubb64Start = pubb64Pos + (int32_t)(sizeof(kPubb64Key) - 1);
+              int32_t pubb64End = serialStr.FindChar('"', pubb64Start);
+
+              // Extract sigs object: {"<addr>": "<base64sig>", ...}
+              // Simple extraction: find the sig for aOwnerAddress
+              int32_t sigsObjStart = sigsPos + (int32_t)(sizeof(kSigsKey) - 2); // points to '{'
+
+              if (pubb64End > pubb64Start) {
+                nsAutoCString pubb64Val(Substring(serialStr, pubb64Start,
+                                                   pubb64End - pubb64Start));
+
+                // Look for our owner address in sigs
+                nsAutoCString addrKey;
+                addrKey.Append('"');
+                addrKey.Append(aOwnerAddress);
+                addrKey.AppendLiteral("\": \"");
+                int32_t addrPos = serialStr.Find(addrKey, sigsObjStart);
+
+                // Also try without space after colon
+                if (addrPos < 0) {
+                  addrKey.Assign('"');
+                  addrKey.Append(aOwnerAddress);
+                  addrKey.AppendLiteral("\": \"");
+                  addrPos = serialStr.Find(addrKey, sigsObjStart);
+                }
+                if (addrPos < 0) {
+                  nsAutoCString addrKey2;
+                  addrKey2.Append('"');
+                  addrKey2.Append(aOwnerAddress);
+                  addrKey2.AppendLiteral("\",\"");
+                  addrPos = serialStr.Find(addrKey2, sigsObjStart);
+                  if (addrPos >= 0) {
+                    // Find the sig value after the next :
+                    int32_t colonPos = serialStr.FindChar(':', addrPos + addrKey2.Length());
+                    if (colonPos >= 0) {
+                      int32_t quotePos = serialStr.FindChar('"', colonPos);
+                      if (quotePos >= 0) addrPos = quotePos - (int32_t)(addrKey.Length() - 1);
+                    }
+                  }
+                }
+
+                if (addrPos >= 0) {
+                  // Find the signature value (after the opening quote)
+                  int32_t sigStart = serialStr.FindChar('"', addrPos + (int32_t)aOwnerAddress.Length() + 1);
+                  if (sigStart >= 0) {
+                    sigStart++; // skip opening quote
+                    int32_t sigEnd = serialStr.FindChar('"', sigStart);
+                    if (sigEnd > sigStart) {
+                      nsAutoCString sigBase64(Substring(serialStr, sigStart,
+                                                         sigEnd - sigStart));
+
+                      // Reconstruct the signed message
+                      // Format: "Namecoin X.509 Stapled Certification:"
+                      //         + {"address":"<addr>","domain":"<host>","x509pub":"<pubb64>"}
+                      // Note: JSON keys are alphabetically sorted (address, domain, x509pub)
+                      nsAutoCString signedMsg;
+                      signedMsg.AssignLiteral("Namecoin X.509 Stapled Certification: ");
+                      signedMsg.AppendLiteral("{\"address\":\"");
+                      signedMsg.Append(aOwnerAddress);
+                      signedMsg.AppendLiteral("\",\"domain\":\"");
+                      // Use apex domain (strip leading subdomain labels, keep .bit)
+                      nsAutoCString hostLower(aHost);
+                      ToLowerCase(hostLower);
+                      signedMsg.Append(hostLower);
+                      signedMsg.AppendLiteral("\",\"x509pub\":\"");
+                      signedMsg.Append(pubb64Val);
+                      signedMsg.AppendLiteral("\"}");
+
+                      DANE_LOG("NmcValidateDane: verifying ncgencert sig for %s",
+                               nsPromiseFlatCString(aOwnerAddress).get());
+
+                      if (NmcVerifyMessageSignature(aOwnerAddress, signedMsg,
+                                                     sigBase64)) {
+                        DANE_LOG("NmcValidateDane: ncgencert sig verified → "
+                                 "NMC_DANE_OK (owner=%s)",
+                                 nsPromiseFlatCString(aOwnerAddress).get());
+                        return NmcDaneValidateResult::NMC_DANE_OK;
+                      } else {
+                        DANE_ERR("NmcValidateDane: ncgencert sig FAILED for %s",
+                                 nsPromiseFlatCString(aOwnerAddress).get());
+                        // Sig exists but is invalid — hard fail
+                        return NmcDaneValidateResult::NMC_DANE_FAIL;
+                      }
+                    }
+                  }
+                } else {
+                  DANE_LOG("NmcValidateDane: no sig for owner %s in sigs",
+                           nsPromiseFlatCString(aOwnerAddress).get());
+                }
+              }
+            }
+          }
+        }
+        node = CERT_LIST_NEXT(node);
+      }
+    }
+
     DANE_LOG("NmcValidateDane: no TLSA records → NMC_DANE_NO_RECORD");
     return NmcDaneValidateResult::NMC_DANE_NO_RECORD;
   }
