@@ -1237,6 +1237,12 @@ nsresult nsHostResolver::NameLookup(nsHostRecord* rec,
                 new AddrInfo(hostCopy, DNSResolverType::Native, 0,
                              std::move(addrs), nmcResult.ttlSeconds);
 
+            // Set effective TRR mode before MaybeRenewHostRecordLocked and
+            // CompleteLookupLocked — both paths call ResolveComplete() which
+            // switch()es on mEffectiveTRRMode and hits MOZ_ASSERT_UNREACHABLE
+            // if it's still TRR_DEFAULT_MODE (crash #8).
+            addrRec->mEffectiveTRRMode = nsIRequest::TRR_DISABLED_MODE;
+
             // Remove from eviction queue before CompleteLookupLocked
             // re-adds it (same pattern as NativeLookup/TrrLookup).
             MaybeRenewHostRecordLocked(rec, aLock);

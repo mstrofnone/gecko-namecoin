@@ -15226,47 +15226,6 @@
   value: false
   mirror: always
 
-# -----------------------------------------------------------------------
-# Namecoin (.bit) native DNS resolution
-# -----------------------------------------------------------------------
-
-# Master switch for Namecoin .bit domain resolution via ElectrumX
-- name: network.namecoin.enabled
-  type: RelaxedAtomicBool
-  value: false
-  mirror: always
-
-# Comma-separated list of ElectrumX servers (wss:// URLs)
-- name: network.namecoin.electrumx_servers
-  type: String
-  # Use IP to avoid DNS deadlock (see nsNamecoinResolver.cpp kDefaultServers)
-  value: "ws://162.212.154.52:50003"
-  mirror: never
-
-# TTL for resolved Namecoin addresses in seconds
-- name: network.namecoin.cache_ttl_seconds
-  type: RelaxedAtomicUint32
-  value: 3600
-  mirror: always
-
-# Maximum number of alias hops to follow
-- name: network.namecoin.max_alias_hops
-  type: RelaxedAtomicUint32
-  value: 5
-  mirror: always
-
-# Connection timeout for ElectrumX WebSocket in milliseconds
-- name: network.namecoin.connection_timeout_ms
-  type: RelaxedAtomicUint32
-  value: 10000
-  mirror: always
-
-# Query multiple servers simultaneously for redundancy
-- name: network.namecoin.query_multiple_servers
-  type: RelaxedAtomicBool
-  value: false
-  mirror: always
-
 # Whether to prefer IPv6 name lookups.
 - name: network.dns.preferIPv6
   type: RelaxedAtomicBool

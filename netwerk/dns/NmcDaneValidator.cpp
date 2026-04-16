@@ -44,6 +44,7 @@
 #include "keyhi.h"        // SECKEY_DecodeDERSubjectPublicKeyInfo
 #include "secitem.h"      // SECItem
 #include "secder.h"       // DER utilities
+#include "secoid.h"       // SEC_OID_AVA_SERIAL_NUMBER
 
 namespace mozilla {
 namespace net {
@@ -485,6 +486,107 @@ static bool NmcDaneMatchSingleRecord(const NamecoinTLSARecord& aRecord,
 }
 
 // ---------------------------------------------------------------------------
+// NmcDaneExtractStapledSpki
+//
+// The x--nmc AIA scheme encodes the root CA's SPKI in the intermediate CA
+// cert's serialNumber field as a JSON blob:
+//   "Namecoin TLS Certificate\n\nStapled: {\"pubb64\":\"<url-safe-base64-SPKI>\"}"
+//
+// This function extracts the pubb64 bytes from a cert's serialNumber if
+// present, for use in DANE-TA validation.
+//
+// @param aCert    A certificate (typically an intermediate CA in the chain)
+// @param aOutput  Output: the decoded SPKI bytes from pubb64
+// @returns NS_OK if pubb64 was found and decoded
+// ---------------------------------------------------------------------------
+
+static nsresult NmcDaneExtractStapledSpki(CERTCertificate* aCert,
+                                           nsTArray<uint8_t>& aOutput) {
+  if (!aCert) return NS_ERROR_INVALID_ARG;
+
+  // The x--nmc AIA scheme encodes the root CA's SPKI in the ISSUER DN's
+  // serialNumber attribute of the intermediate CA cert, NOT in the cert's
+  // own integer serial number.
+  //
+  // Chain cert (intermediate CA) structure:
+  //   Subject: CN=testls.bit Domain CA, serialNumber=Namecoin TLS Certificate
+  //   Issuer:  CN=testls.bit Domain AIA Parent CA,
+  //            serialNumber=Namecoin TLS Certificate\n\nStapled: {"pubb64":"..."}
+  //
+  // So we read aCert->issuer's serialNumber AVA (OID 2.5.4.5) to get the
+  // text that contains the JSON-encoded pubb64 SPKI.
+  //
+  // CERT_GetNameElement() is not public; we iterate the CERTName's rdns/avas
+  // directly using public types and CERT_GetAVATag / CERT_DecodeAVAValue.
+  // CERT_NameToAscii would truncate the serialNumber at 64 chars (too short).
+  nsAutoCString serialStr;
+  {
+    CERTRDN** rdns = aCert->issuer.rdns;
+    bool found = false;
+    if (rdns) {
+      for (CERTRDN** rdnp = rdns; *rdnp && !found; ++rdnp) {
+        CERTAVA** avas = (*rdnp)->avas;
+        if (!avas) continue;
+        for (CERTAVA** avap = avas; *avap && !found; ++avap) {
+          CERTAVA* ava = *avap;
+          if (SECOID_FindOIDTag(&ava->type) == SEC_OID_AVA_SERIAL_NUMBER) {
+            // Decode the AVA value bytes to a string
+            SECItem* val = CERT_DecodeAVAValue(&ava->value);
+            if (val && val->data && val->len > 0) {
+              serialStr.Assign(reinterpret_cast<const char*>(val->data),
+                               (uint32_t)val->len);
+              found = true;
+            }
+            if (val) SECITEM_FreeItem(val, PR_TRUE);
+          }
+        }
+      }
+    }
+    if (!found) {
+      DANE_LOG("ExtractStapledSpki: no serialNumber AVA in issuer DN");
+      return NS_ERROR_NOT_AVAILABLE;
+    }
+  }
+
+  if (serialStr.Length() < 4) return NS_ERROR_NOT_AVAILABLE;
+
+  DANE_LOG("ExtractStapledSpki: issuer serialNumber = '%s'",
+           serialStr.get());
+
+  // Look for the pubb64 JSON field
+  static const char kPubb64Key[] = "\"pubb64\":\"";
+  int32_t keyPos = serialStr.Find(kPubb64Key);
+  if (keyPos < 0) return NS_ERROR_NOT_AVAILABLE;
+
+  int32_t valueStart = keyPos + (int32_t)(sizeof(kPubb64Key) - 1);
+  int32_t valueEnd = serialStr.FindChar('"', valueStart);
+  if (valueEnd < 0) return NS_ERROR_FAILURE;
+
+  nsAutoCString pubb64(Substring(serialStr, valueStart,
+                                  valueEnd - valueStart));
+  // Convert URL-safe base64 to standard base64
+  pubb64.ReplaceChar('-', '+');
+  pubb64.ReplaceChar('_', '/');
+  // Add padding
+  while (pubb64.Length() % 4 != 0) {
+    pubb64.Append('=');
+  }
+
+  nsAutoCString decoded;
+  nsresult rv = mozilla::Base64Decode(pubb64, decoded);
+  if (NS_FAILED(rv)) {
+    DANE_ERR("ExtractStapledSpki: base64 decode failed for pubb64");
+    return NS_ERROR_FAILURE;
+  }
+
+  aOutput.SetLength(decoded.Length());
+  memcpy(aOutput.Elements(), decoded.BeginReading(), decoded.Length());
+  DANE_LOG("ExtractStapledSpki: extracted %u bytes of SPKI from serial",
+           (unsigned)aOutput.Length());
+  return NS_OK;
+}
+
+// ---------------------------------------------------------------------------
 // NmcValidateDane — Main entry point
 // ---------------------------------------------------------------------------
 
@@ -545,10 +647,52 @@ NmcDaneValidateResult NmcValidateDane(
           while (!CERT_LIST_END(node, aCertChain)) {
             CERTCertificate* chainCert = node->cert;
             if (chainCert && chainCert != aCert) {
+              // Standard check: match the chain cert's own SPKI/DER
               if (NmcDaneMatchSingleRecord(rec, chainCert)) {
                 DANE_LOG("NmcValidateDane: DANE-TA match on chain cert → "
                          "NMC_DANE_OK");
                 return NmcDaneValidateResult::NMC_DANE_OK;
+              }
+
+              // x--nmc AIA stapling: the chain cert may have a pubb64 field
+              // in its serialNumber encoding the root CA's SPKI. If the TLSA
+              // record uses selector=1 (SPKI), check the stapled SPKI too.
+              if (rec.selector == 1) {
+                nsTArray<uint8_t> stapledSpki;
+                if (NS_SUCCEEDED(
+                        NmcDaneExtractStapledSpki(chainCert, stapledSpki))) {
+                  // Compute the match on the stapled SPKI bytes
+                  nsTArray<uint8_t> computed;
+                  if (NS_SUCCEEDED(NmcDaneComputeMatch(stapledSpki,
+                                                        rec.matchType,
+                                                        computed))) {
+                    // Decode the TLSA record data
+                    nsTArray<uint8_t> recordData;
+                    bool decoded = DaneHexDecode(rec.data, recordData);
+                    if (!decoded) {
+                      nsAutoCString b64decoded;
+                      if (NS_SUCCEEDED(
+                              mozilla::Base64Decode(rec.data, b64decoded))) {
+                        recordData.SetLength(b64decoded.Length());
+                        memcpy(recordData.Elements(),
+                               b64decoded.BeginReading(),
+                               b64decoded.Length());
+                        decoded = true;
+                      }
+                    }
+                    if (decoded && computed.Length() == recordData.Length()) {
+                      uint8_t diff = 0;
+                      for (size_t k = 0; k < computed.Length(); k++) {
+                        diff |= computed[k] ^ recordData[k];
+                      }
+                      if (diff == 0) {
+                        DANE_LOG("NmcValidateDane: DANE-TA match via stapled "
+                                 "pubb64 in chain cert → NMC_DANE_OK");
+                        return NmcDaneValidateResult::NMC_DANE_OK;
+                      }
+                    }
+                  }
+                }
               }
             }
             node = CERT_LIST_NEXT(node);

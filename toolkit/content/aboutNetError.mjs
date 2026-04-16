@@ -744,11 +744,6 @@ function getNetErrorDescParts(noConnectivity) {
         ["li", "neterror-corrupted-content-contact-website"],
       ];
     case "dnsNotFound":
-      if (HOST_NAME && HOST_NAME.endsWith(".bit")) {
-        return [
-          ["p", "neterror-namecoin-not-found-description"],
-        ];
-      }
       if (noConnectivity) {
         return [
           ["span", "neterror-dns-not-found-offline-hint-header"],

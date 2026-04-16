@@ -99,7 +99,6 @@ modules["DOM_QM"] = Mod(46)
 # returning codes from other modules that might also use
 # the generic base.
 modules["GENERAL"] = Mod(51)
-modules["NAMECOIN"] = Mod(77)
 
 MODULE_BASE_OFFSET = 0x45
 
@@ -1286,22 +1285,6 @@ with modules["GENERAL"]:
     # Error code used to indicate that functionality has been blocked by the
     # Policy Manager
     errors["NS_ERROR_BLOCKED_BY_POLICY"] = FAILURE(3)
-
-
-
-# 77: NS_ERROR_MODULE_NAMECOIN
-# =======================================================================
-with modules["NAMECOIN"]:
-    # Namecoin resolver could not reach any ElectrumX server
-    errors["NS_ERROR_NAMECOIN_SERVERS_UNREACHABLE"] = FAILURE(1)
-    # Requested .bit name not found in Namecoin blockchain
-    errors["NS_ERROR_NAMECOIN_NOT_FOUND"] = FAILURE(2)
-    # Requested .bit name has expired (>36000 blocks since last update)
-    errors["NS_ERROR_NAMECOIN_EXPIRED"] = FAILURE(3)
-    # Resolved .bit name has no usable IP address
-    errors["NS_ERROR_NAMECOIN_NO_ADDRESS"] = FAILURE(4)
-    # DANE certificate validation failed for .bit domain
-    errors["NS_ERROR_NAMECOIN_DANE_FAIL"] = FAILURE(5)
 
 
 def import_extra_errors(infile):

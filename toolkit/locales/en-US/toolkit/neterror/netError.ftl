@@ -187,8 +187,3 @@ certerror-coep-learn-more = Learn more about Cross Origin Embedder Policies (COE
 #   $responsestatus (string) - HTTP response status code (e.g., 500).
 #   $responsestatustext (string) - HTTP response status text (e.g., "Internal Server Error").
 neterror-response-status-code = Error code: { $responsestatus } { $responsestatustext }
-
-## Namecoin (.bit) domain errors
-
-neterror-namecoin-not-found-title = .bit Domain Not Found
-neterror-namecoin-not-found-description = This is a Namecoin blockchain domain (.bit). Firefox could not resolve it because the domain may not exist on the Namecoin blockchain, the Namecoin ElectrumX server may be unreachable, or resolution is not enabled. Enable it in about:config → network.namecoin.enabled.

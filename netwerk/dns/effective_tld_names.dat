@@ -15877,8 +15877,4 @@ enterprisecloud.nu
 // Submitted by Gx1.org <security@gx1.org>
 zone.id
 
-// Namecoin blockchain TLD
-// Native resolution implemented in nsNamecoinResolver.cpp
-bit
-
 // ===END PRIVATE DOMAINS===
