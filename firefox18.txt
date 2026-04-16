@@ -1,0 +1,171 @@
+# firefox18.txt — Session Notes for gecko-namecoin
+# Date: 2026-04-17
+# Sessions covered: 15 (builtChain crash fix + commit restructure + docs rewrite)
+# Previous session notes: firefox17.txt (sessions 11-14)
+#
+# ============================================================================
+# CURRENT STATE
+# ============================================================================
+#
+# Branch: namecoin-phase2
+# Latest commit: (see below — 3 new commits since firefox17.txt)
+# Build: CLEAN (incremental ~20-32s, 0 errors, 1016 pre-existing warnings)
+# Firefox: Runs, .bit DNS resolution works, DANE TLS validation works end-to-end
+# Repo: https://github.com/mstrofnone/gecko-namecoin (pushed to main)
+#
+# Working directory: /Users/m/mozilla-central
+# Build dir: /Users/m/mozilla-central/obj-ff-dbg
+# App bundle: obj-ff-dbg/dist/NightlyDebug.app
+#
+# ============================================================================
+# WHAT WAS DONE IN SESSION 15
+# ============================================================================
+#
+# 1. CRASH #9 FIXED: builtChainBytesArray empty on DANE success dispatch
+#
+#    SYMPTOM: Firefox crashes immediately when DANE validation succeeds for
+#    a .bit domain. Exit code 245. Assertion failure at
+#    SSLServerCertVerification.cpp:1223:
+#      "MOZ_ASSERT_UNREACHABLE: if certificate verification succeeded without
+#       overridden errors, the built chain shouldn't be empty and any error
+#       bits should be unset"
+#
+#    ROOT CAUSE: When AuthCertificate() fails (which it always does for .bit
+#    since no CA trusts these certs), builtChainBytesArray is left empty.
+#    Our DANE success path called Dispatch() with mSucceeded=true but
+#    builtChainBytesArray was empty. Dispatch() asserts non-empty on success.
+#
+#    FIX: Before the DANE success Dispatch(), clone mPeerCertChain into
+#    builtChainBytesArray (the peer chain is what DANE validated). Also clone
+#    mPeerCertChain into a separate copy since both args are std::move'd.
+#
+#    FILE: security/manager/ssl/SSLServerCertVerification.cpp (around line 898)
+#
+# 2. COMMIT RESTRUCTURE: Split the crash fix commit into 3 separate commits
+#
+#    The original commit 7e8938e bundled together:
+#    a) ncgencert Option 2 sig integration in NmcDaneValidator (~150 lines)
+#    b) The builtChainBytesArray crash fix (~15 lines)
+#    c) NAMECOIN.md docs + firefox17.txt
+#
+#    These were split via git reset --soft + selective staging into:
+#    - d31f7db: ncgencert sig integration in NmcDaneValidator (Method 2 wiring)
+#    - b1a1314: builtChainBytesArray crash fix
+#    - (new): Updated NAMECOIN.md + firefox18.txt docs commit
+#
+#    This makes it easy to review each TLS method's code independently:
+#    - Method 1 (DANE-TA hash): d283685 + 3ecfef3
+#    - Method 2 (address sig): f5b6d6d (secp256k1 impl) + d31f7db (integration)
+#
+# 3. NAMECOIN.md REWRITE: Comprehensive documentation covering:
+#    - How .bit DNS resolution works (step by step)
+#    - Background on why .bit sites need special TLS
+#    - How ncgencert works (cert chain structure, AIA Parent CA stapling)
+#    - Method 1: DANE-TA hash in blockchain (with full code path trace)
+#    - Method 2: Namecoin address signature (with full code path trace)
+#    - Decision flow diagram showing which method gets used when
+#    - Why secp256k1 had to be implemented from scratch (NSS freebl limitation)
+#    - Complete component table for NmcSigVerify.cpp
+#    - Architecture diagram (ASCII art)
+#    - File inventory with line counts and roles
+#    - Commit history organized by feature area (DNS, Method 1, Method 2, fixes)
+#    - Build instructions with MOZ_LOG for debugging
+#    - Implementation notes (all 9 crash lessons)
+#    - Known limitations and future work
+#
+# ============================================================================
+# COMMIT LOG (newest first, as pushed to gecko-namecoin/main)
+# ============================================================================
+#
+# (new)     docs: comprehensive NAMECOIN.md rewrite + firefox18.txt
+# b1a1314   fix: populate builtChainBytesArray for DANE success dispatch
+# d31f7db   namecoin: integrate ncgencert Option 2 sig path in DANE validator
+# f5b6d6d   namecoin: ncgencert sig verification + owner address extraction
+# a195994   docs: add NAMECOIN.md + firefox17.txt
+# d283685   namecoin: Phase 2 DANE + ncgencert/x--nmc AIA stapling support
+# 3ecfef3   namecoin: fix NmcDaneExtractStapledSpki to read issuer DN serialNumber AVA
+# fbeb02f   phase2: populate DNS host record from Namecoin resolution
+# c2b84d2   fix: NSPR WebSocket rewrite + crash fixes
+# 8d82081   phase5: three-stage enablement gating
+# 9a13dfc   about:namecoin: wire JS to real XPCOM resolver via JSActor IPC
+# 1dff953   fix: deadlock in NameLookup + debug output
+# 0b2347c   gecko-namecoin: native .bit DNS resolution and TLS/DANE validation
+#
+# ============================================================================
+# CRASHES FIXED (total: 9, sessions 10-15)
+# ============================================================================
+#
+# 1. Deadlock (session 10): mLock held during blocking WebSocket I/O
+# 2. MainThread MOZ_ASSERT: FetchHTTPSSVC on main thread → guard
+# 3. Socket thread Preferences: GetBool → InitStaticMembers crash → StaticPrefs
+# 4. WebSocketChannel assertion: ctor requires main thread → dispatched
+# 5. LoadInfo null deref: AsyncOpenNative needs InitLoadInfoNative
+# 6. Admission deadlock: nsIWebSocketChannel → NSPR rewrite (architectural fix)
+# 7. Eviction queue assertion: MaybeRenewHostRecordLocked before mResolving++
+# 8. TRR mode assertion: set mEffectiveTRRMode before CompleteLookupLocked
+# 9. builtChainBytesArray empty: clone mPeerCertChain before DANE success Dispatch
+#
+# ============================================================================
+# KEY ARCHITECTURE DECISIONS
+# ============================================================================
+#
+# - NSPR raw sockets for ElectrumX (not Gecko WebSocket — deadlock risk)
+# - StaticPrefs for thread-safe pref access (not Preferences::GetBool)
+# - secp256k1 from scratch in C++ (NSS freebl marks it unsupported)
+# - RIPEMD-160 from scratch (NSS doesn't expose it)
+# - Owner address extracted from NAME_UPDATE scriptPubKey (P2PKH)
+# - DANE hook in SSLServerCertVerification AFTER AuthCertificate failure
+# - Static name-value cache bridges DNS resolution → TLS validation
+# - Method 1 takes priority over Method 2 when TLSA records exist
+# - Hard fail (no click-through) when TLSA/sig exist but don't match
+#
+# ============================================================================
+# HOW TO LAUNCH FOR TESTING
+# ============================================================================
+#
+# cd /Users/m/mozilla-central
+# ./mach build
+# MOZ_LOG="nsNamecoinResolver:5,NmcDaneValidator:5,NmcSigVerify:5" \
+#   ./mach run --setpref "network.namecoin.enabled=true"
+#
+# ============================================================================
+# WHAT TO DO NEXT
+# ============================================================================
+#
+# 1. END-TO-END TEST: Need a real .bit domain with ncgencert chain.pem on an
+#    HTTPS server. testls.bit (107.152.38.155) accepts TCP but server-side
+#    doesn't respond to HTTP/HTTPS.
+#
+# 2. DEHYDRATED CERTIFICATES: Compact cert representations stored in blockchain,
+#    "rehydrated" into full X.509 by the client. See ncdns certdehydrate.
+#
+# 3. AIA FETCHING: When server only sends EE cert, Firefox may try to fetch
+#    intermediate via http://aia.x--nmc.bit/aia?... (itself a .bit domain).
+#    Could intercept and construct CA cert locally from pubb64 query param.
+#
+# 4. UI INDICATORS: Lock icon should show "Namecoin DANE validated" instead
+#    of cert error. about:namecoin page could show more DANE status info.
+#
+# 5. ELECTRUMX CONSENSUS: Query N servers, require agreement for security.
+#
+# 6. CONSTANT-TIME secp256k1: Current double-and-add leaks timing. OK for
+#    verification (public data) but would need fixing for signing.
+#
+# ============================================================================
+# IMPORTANT FILES QUICK REFERENCE
+# ============================================================================
+#
+# Code:
+#   netwerk/dns/nsNamecoinResolver.cpp   — DNS resolution + ElectrumX + cache
+#   netwerk/dns/NmcDaneValidator.cpp     — DANE validation (both methods)
+#   netwerk/dns/NmcSigVerify.cpp         — secp256k1 + RIPEMD-160 + Base58Check
+#   security/manager/ssl/SSLServerCertVerification.cpp — DANE hook + built chain fix
+#
+# Documentation:
+#   NAMECOIN.md      — Full project documentation
+#   firefox17.txt    — Session notes 11-14
+#   firefox18.txt    — Session notes 15 (this file)
+#
+# Test data:
+#   /tmp/ncgencert-test/  — Generated test certs from session 14
+#   /tmp/ncgencert/       — ncgencert binary (Go 1.26)

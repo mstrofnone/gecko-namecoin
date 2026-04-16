@@ -1,0 +1,274 @@
+# firefox17.txt — Session Notes for gecko-namecoin
+# Date: 2026-04-17
+# Sessions covered: 14 (ncgencert integration + GitHub update)
+# Previous session notes: firefox11.txt (session 11), firefox13.txt (session 13)
+#
+# ============================================================================
+# CURRENT STATE
+# ============================================================================
+#
+# Branch: namecoin-phase2
+# Latest commit: f5b6d6d594 (pushed to mstrofnone/gecko-namecoin main)
+# Build: CLEAN (22s incremental, 0 errors, 1016 pre-existing warnings)
+# Firefox: Runs, .bit DNS resolution works end-to-end
+# Repo: https://github.com/mstrofnone/gecko-namecoin
+#
+# Working directory: /Users/m/mozilla-central
+# Build dir: /Users/m/mozilla-central/obj-ff-dbg
+# App bundle: obj-ff-dbg/dist/NightlyDebug.app
+#
+# ============================================================================
+# WHAT WAS DONE IN SESSION 14
+# ============================================================================
+#
+# 1. Analyzed ncgencert (https://github.com/namecoin/ncgencert) source code
+#    - Built from source at /tmp/ncgencert
+#    - Generated test certs: /tmp/ncgencert-test/
+#    - Key finding: namecoin.json contains SHA-256 of AIA Parent CA SPKI
+#      (NOT the Domain CA SPKI — this is the cert NOT in chain.pem)
+#    - The pubb64 in Domain CA's issuer serialNumber = AIA Parent CA's SPKI
+#    - Our NmcDaneExtractStapledSpki correctly extracts this
+#
+# 2. Committed Phase 2 DANE (d283685a74):
+#    - SSLServerCertVerification.cpp DANE hook after CA validation failure
+#    - Static name-value cache (StoreNameValue/GetStoredNameValue)
+#    - Wildcard map["*"].tls TLSA collection
+#    - mEffectiveTRRMode crash fix
+#    - StaticPrefList.yaml prefs, moz.build additions
+#
+# 3. Implemented ncgencert sig verification (f5b6d6d594):
+#    - NmcSigVerify.cpp/h: Full secp256k1 implementation from scratch
+#    - DecodeNameScriptWithAddress: owner address from NAME_UPDATE tx
+#    - NmcDaneValidator: ncgencert Option 2 (sig-only, no TLSA needed)
+#    - Both commits pushed to GitHub
+#
+# 4. Updated repo description and wrote NAMECOIN.md documentation
+#
+# ============================================================================
+# ARCHITECTURE OVERVIEW
+# ============================================================================
+#
+# DNS RESOLUTION PIPELINE:
+#
+#   nsHostResolver::NameLookup()
+#     → if .bit && network.namecoin.enabled
+#     → nsNamecoinResolver::ResolveSync(hostname, result)
+#       → ComputeScripthash("d/example")  [OP_NAME_UPDATE + SHA-256 + reverse]
+#       → ElectrumXRequestAny("blockchain.scripthash.get_history", ...)
+#       → ElectrumXRequestAny("blockchain.transaction.get", ...)
+#       → DecodeNameScriptWithAddress(scriptHex, name, value, ownerAddress)
+#       → ParseNameValue(valueJson, hostname, nameValue)  [ip, ip6, tls, map, alias]
+#       → Populate result.addresses from ip/ip6
+#     → StoreNameValue(hostname, nameValue, ownerAddress, ttl)  [static cache]
+#     → CompleteLookupLocked(rec, NS_OK, addrinfo, ...)
+#
+# TLS VALIDATION PIPELINE:
+#
+#   SSLServerCertVerificationJob::Run()
+#     → AuthCertificate() fails for .bit (no CA trust)
+#     → if IsNamecoinHost(mHostName) && namecoin.enabled
+#       → GetStoredNameValue(hostname, nameValue, ownerAddress)
+#       → Build CERTCertList from mPeerCertChain[1..]
+#       → NmcValidateDane(nameValue, serverCert, certChain, host, port, ownerAddress)
+#
+#   NmcValidateDane():
+#     Step 1: GetTlsaForPort(nameValue, port, records)
+#             - Checks _tcp._<port> in map first, then top-level tls array
+#     Step 2a: If records exist:
+#             - DANE-EE (usage 3): NmcDaneMatchSingleRecord(rec, serverCert)
+#             - DANE-TA (usage 2): walk chain:
+#               → NmcDaneMatchSingleRecord(rec, chainCert)  [direct SPKI match]
+#               → NmcDaneExtractStapledSpki(chainCert)  [pubb64 from issuer DN]
+#               → Hash + compare to TLSA record
+#     Step 2b: If records empty + ownerAddress not empty:
+#             - ncgencert sig path:
+#               → Extract issuer serialNumber → find pubb64 + sigs
+#               → Reconstruct signed message
+#               → NmcVerifyMessageSignature(ownerAddress, message, sigBase64)
+#                 → secp256k1 ECDSA recovery → address derivation → match
+#
+# ============================================================================
+# FILES AND THEIR ROLES
+# ============================================================================
+#
+# netwerk/dns/nsNamecoinResolver.cpp  (2080+ lines)
+#   - Main resolver: ElectrumX WebSocket pool (NSPR raw sockets)
+#   - JSON parser (custom minimal parser, no DOM dependency)
+#   - NAME_UPDATE script decoder
+#   - ComputeScripthash, ParseNameValue, DecodeNameScript
+#   - DecodeNameScriptWithAddress (owner address from scriptPubKey)
+#   - Static name-value cache (StoreNameValue/GetStoredNameValue)
+#
+# netwerk/dns/nsNamecoinResolver.h
+#   - NamecoinTLSARecord, NamecoinNameValue, NamecoinResolveResult structs
+#   - nsNamecoinResolver class declaration
+#   - Static cache types (NameValueCacheEntry)
+#
+# netwerk/dns/nsNamecoinErrors.h
+#   - NMC_LOG/NMC_ERR macros, HexEncode/HexDecode, opcodes
+#
+# netwerk/dns/NmcDaneValidator.cpp  (726+ lines)
+#   - NmcValidateDane() — main DANE entry point
+#   - NmcDaneMatchSingleRecord() — single TLSA record vs cert
+#   - NmcDaneExtractCertData() — DER or SPKI extraction from cert
+#   - NmcDaneComputeMatch() — SHA-256/SHA-512/exact comparison
+#   - NmcDaneExtractStapledSpki() — x--nmc AIA pubb64 from issuer DN
+#   - NmcDaneCache — validation result cache
+#   - GetTlsaForPort() — port-specific TLSA lookup
+#   - ncgencert sig path — extract sigs from serialNumber, call NmcVerifyMessageSignature
+#
+# netwerk/dns/NmcDaneValidator.h
+#   - NmcDaneValidateResult enum (OK, NO_RECORD, FAIL)
+#   - NmcDaneCache class
+#   - Function declarations
+#
+# netwerk/dns/NmcSigVerify.cpp  (~780 lines)
+#   - U256: 256-bit big integer (4x uint64_t, little-endian limbs)
+#   - secp256k1 curve parameters (p, n, G)
+#   - u256_add, u256_sub, u256_mul_mod (double-and-add), u256_modinv (Fermat)
+#   - JPoint: Jacobian projective EC point
+#   - jpoint_double, jpoint_add, jpoint_to_affine, point_mul
+#   - lift_x: compute Y from X on secp256k1 (p ≡ 3 mod 4 → sqrt easy)
+#   - ecdsa_recover: public key recovery from (r, s, hash, recid)
+#   - sha256d: double SHA-256 via NSS
+#   - bitcoin_message_hash: "\x18Bitcoin Signed Message:\n" + varint + msg
+#   - ripemd160: standalone RIPEMD-160 (NSS doesn't have it!)
+#   - base58_encode: for Namecoin address formatting
+#   - pubkey_to_namecoin_address: compressed pubkey → Base58Check address
+#   - NmcVerifyMessageSignature, NmcRecoverSigningAddress
+#
+# netwerk/dns/NmcSigVerify.h
+#   - NmcVerifyMessageSignature(address, message, sig_base64) -> bool
+#   - NmcRecoverSigningAddress(message, sig_base64, &address) -> nsresult
+#
+# netwerk/dns/nsHostResolver.cpp  (MODIFIED)
+#   - NameLookup(): .bit check → nsNamecoinResolver::ResolveSync
+#   - StoreNameValue() call after successful resolution
+#   - CompleteLookupLocked() with populated addr info
+#
+# security/manager/ssl/SSLServerCertVerification.cpp  (MODIFIED)
+#   - DANE hook after AuthCertificate failure for .bit domains
+#   - Builds CERTCertList from mPeerCertChain
+#   - Calls NmcValidateDane(), dispatches success/failure
+#
+# modules/libpref/init/StaticPrefList.yaml  (MODIFIED)
+#   - network.namecoin.enabled (bool, false)
+#   - network.namecoin.electrumx_servers (string)
+#   - network.namecoin.cache_ttl_seconds (int, 3600)
+#   - network.namecoin.max_alias_hops (int, 5)
+#   - network.namecoin.connection_timeout_ms (int, 10000)
+#   - network.namecoin.require_tls (bool, true)
+#
+# ============================================================================
+# CRITICAL IMPLEMENTATION NOTES (READ THESE!)
+# ============================================================================
+#
+# 1. SCRIPTHASH OPCODE: Must use OP_NAME_UPDATE (0x53), NOT OP_NAME_SHOW.
+#    Wrong opcode = empty history from ElectrumX (silent failure).
+#
+# 2. NSPR SOCKETS, NOT nsIWebSocketChannel: Gecko's WebSocket requires main
+#    thread creation + admission DNS → deadlock from DNS resolver threads.
+#    NSPR PR_OpenTCPSocket + PR_Connect works on any thread.
+#
+# 3. StaticPrefs, NOT Preferences::GetBool: GetBool crashes on socket thread
+#    (InitStaticMembers → IsInServoTraversal null deref). StaticPrefs uses
+#    atomic reads, safe from any thread.
+#
+# 4. mEffectiveTRRMode: Must set to TRR_DISABLED_MODE BEFORE CompleteLookupLocked.
+#    Default TRR_DEFAULT_MODE hits MOZ_ASSERT_UNREACHABLE in ResolveComplete().
+#
+# 5. MaybeRenewHostRecordLocked: Must call BEFORE mResolving++ to avoid
+#    "Already in eviction queue" assertion (record may be cached from prior lookup).
+#
+# 6. mach build (FULL): `mach build netwerk/dns/` only recompiles .o files
+#    but does NOT relink XUL. Always `mach build` for binary changes.
+#
+# 7. NmcDaneExtractStapledSpki reads from aCert->issuer (NOT subject).
+#    The AIA Parent CA encodes pubb64 in the issuer's serialNumber AVA,
+#    NOT in the cert's own serial number integer.
+#
+# 8. ncgencert namecoin.json is SHA-256 of AIA Parent CA SPKI (NOT Domain CA).
+#    The AIA Parent CA is NOT in chain.pem — only its SPKI is stapled in
+#    the Domain CA cert's issuer serialNumber.
+#
+# 9. secp256k1 NOT in NSS: NSS has the OID (SEC_OID_SECG_EC_SECP256K1) but
+#    freebl marks it "unsupported". Cannot use PK11 or SEC functions for it.
+#    Must implement EC arithmetic from scratch.
+#
+# 10. RIPEMD-160 NOT in NSS: hasht.h only lists SHA family + MD2/MD5.
+#     HASH_HashBuf(HASH_AlgRIPEMD160, ...) doesn't exist. Standalone impl needed.
+#
+# 11. SIG_ERR macro: POSIX defines SIG_ERR in <signal.h>. Our macro must use
+#     a different name (NMC_SIG_ERR) to avoid redefinition warning.
+#
+# 12. secp256k1 p ≡ 3 (mod 4): Square root is easy: a^((p+1)/4) mod p.
+#     This is used in lift_x() to compute Y from X on the curve.
+#
+# 13. Namecoin address version byte: 0x34 (P2PKH), 0x0d (P2SH).
+#     Bitcoin uses 0x00/0x05. DO NOT mix them up.
+#
+# 14. Bitcoin signmessage format: recovery byte (27-30 or 31-34 for compressed)
+#     + 32-byte R + 32-byte S. Total 65 bytes, base64 encoded.
+#
+# ============================================================================
+# CRASHES FIXED (sessions 10-14, total 8)
+# ============================================================================
+#
+# 1. Deadlock (session 10): mLock held during blocking WebSocket I/O
+# 2. MainThread MOZ_ASSERT: FetchHTTPSSVC on main thread → guard
+# 3. Socket thread Preferences: GetBool → InitStaticMembers crash → StaticPrefs
+# 4. WebSocketChannel assertion: ctor requires main thread → dispatched
+# 5. LoadInfo null deref: AsyncOpenNative needs InitLoadInfoNative
+# 6. Admission deadlock: nsIWebSocketChannel → NSPR rewrite (architectural fix)
+# 7. Eviction queue assertion: MaybeRenewHostRecordLocked before mResolving++
+# 8. TRR mode assertion: set mEffectiveTRRMode before CompleteLookupLocked
+#
+# ============================================================================
+# ncgencert TEST DATA
+# ============================================================================
+#
+# Test certs generated at /tmp/ncgencert-test/ (session 14):
+#   chain.pem    — EE cert + Domain CA cert
+#   key.pem      — EE private key
+#   caCert.pem   — Domain CA cert (signed by AIA Parent CA)
+#   caAIAKey.pem — AIA Parent CA private key
+#   namecoin.json — TLSA record [2,1,1,"ajSshY0WuR1zn0ieD3tOchvJ1VQczNfi5mgyaLNurMc="]
+#   caAIAMessage.txt — Message to sign for Option 2
+#
+# Verified: SHA-256(pubb64 from caCert issuer serialNumber) == namecoin.json TLSA hash ✅
+#
+# ncgencert binary: /tmp/ncgencert/ncgencert (Go 1.26)
+# To rebuild: cd /tmp/ncgencert && go mod init ncgencert && go mod tidy && go build .
+#
+# ============================================================================
+# WHAT TO DO NEXT
+# ============================================================================
+#
+# 1. END-TO-END TEST: Need a real .bit domain with ncgencert chain.pem on an
+#    HTTPS server. testls.bit (107.152.38.155) accepts TCP but doesn't respond
+#    to HTTP/HTTPS — that's a server-side issue, not ours.
+#
+# 2. DEHYDRATED CERTIFICATES: Namecoin also supports "dehydrated certs" —
+#    compact cert representations stored directly in the blockchain that get
+#    "rehydrated" into full X.509 certs by the client. See ncdns certdehydrate
+#    package. Not yet implemented.
+#
+# 3. AIA FETCHING: When a server only sends the EE cert (not chain.pem),
+#    Firefox's cert verifier may try to fetch the intermediate CA via the AIA
+#    URL (http://aia.x--nmc.bit/aia?...). This requires:
+#    a) Resolving aia.x--nmc.bit (which is a .bit domain itself!)
+#    b) Or intercepting the AIA fetch and constructing the CA cert locally
+#       from the pubb64 query parameter
+#    Not yet implemented.
+#
+# 4. CONSTANT-TIME secp256k1: Our implementation uses double-and-add which
+#    leaks timing information. Acceptable for signature VERIFICATION (public
+#    data only), but should NOT be used for key generation or signing.
+#
+# 5. UI INDICATORS: about:namecoin page exists but could show more DANE info.
+#    The lock icon in the URL bar should indicate "Namecoin DANE validated"
+#    instead of showing a cert error.
+#
+# 6. MULTIPLE ElectrumX SERVERS: Current code supports failover to multiple
+#    servers. Consider adding consensus verification (query N servers, require
+#    agreement) for additional security.
