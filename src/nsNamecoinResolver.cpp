@@ -9,7 +9,7 @@
  * Phase 1: DNS only (A/AAAA records from Namecoin blockchain via ElectrumX)
  *
  * Reference implementation (JavaScript): tls-namecoin-ext/background/electrumx-ws.js
- * Spec: docs/PHASE1.md + SPEC.md (Sections 2, 3, 4)
+ * Spec: gecko-namecoin/docs/PHASE1.md + firefox2.txt (Sections 2, 3, 4)
  *
  * KEY IMPLEMENTATION NOTES:
  *
@@ -44,6 +44,7 @@
 
 #include "nsNamecoinResolver.h"
 #include "nsNamecoinErrors.h"
+#include <cstdio>
 
 // Mozilla / Gecko includes
 #include "mozilla/Logging.h"
@@ -51,7 +52,6 @@
 #include "mozilla/Preferences.h"
 #include "mozilla/Base64.h"
 #include "mozilla/ScopeExit.h"
-#include "mozilla/StaticPrefs_network.h"
 #include "nsThreadUtils.h"
 #include "nsNetUtil.h"
 #include "nsIIOService.h"
@@ -59,15 +59,15 @@
 #include "nsIWebSocketListener.h"
 #include "nsIEventTarget.h"
 #include "nsServiceManagerUtils.h"
-#include "nsStringAPI.h"
+#include "mozilla/OriginAttributes.h"
+#include "nsString.h"
 #include "prnetdb.h"          // PR_StringToNetAddr
 
 // NSS (for SHA-256)
 #include "sechash.h"          // HASH_HashBuf, HASH_SHA256
 #include "pk11func.h"
 
-// JSON
-#include "mozilla/dom/JSON.h"
+// JSON parsing is done via manual string extraction (no SpiderMonkey dependency)
 
 // ---------------------------------------------------------------------------
 
@@ -317,80 +317,8 @@ nsNamecoinResolver::nsNamecoinResolver()
 
 nsNamecoinResolver::~nsNamecoinResolver() { Shutdown(); }
 
-nsresult nsNamecoinResolver::Init() {
-  MutexAutoLock lock(mMutex);
-
-  mEnabled = Preferences::GetBool(kPrefEnabled, false);
-  if (!mEnabled) {
-    NMC_LOG("Namecoin resolver disabled via pref");
-    return NS_OK;
-  }
-
-  // Server list
-  nsAutoCString serversPref;
-  Preferences::GetCString(kPrefServers, serversPref);
-  if (serversPref.IsEmpty()) {
-    serversPref.AssignLiteral(kDefaultServers);
-  }
-
-  // Split comma-separated server list
-  mServers.Clear();
-  nsCCharSeparatedTokenizer tokenizer(serversPref, ',');
-  while (tokenizer.hasMoreTokens()) {
-    nsAutoCString server(tokenizer.nextToken());
-    server.Trim(" \t");
-    if (!server.IsEmpty()) {
-      mServers.AppendElement(server);
-    }
-  }
-
-  if (mServers.IsEmpty()) {
-    NMC_ERR("Namecoin: no ElectrumX servers configured");
-    mEnabled = false;
-    return NS_ERROR_NOT_INITIALIZED;
-  }
-
-  mCacheTTLSeconds  = Preferences::GetUint(kPrefCacheTTL, 3600);
-  mMaxAliasHops     = Preferences::GetUint(kPrefMaxAlias, 5);
-  mConnectionTimeoutMs = Preferences::GetUint(kPrefTimeout, 10000);
-  mQueryMultipleServers = Preferences::GetBool(kPrefQueryMultiple, false);
-
-  // Create WebSocket connection pool.
-  // Idle TTL = cache_ttl_seconds (connections stay open as long as cached
-  // results are valid, since we'll likely need them again for related queries).
-  uint32_t idleTTLMs = mCacheTTLSeconds * 1000;
-  mConnectionPool = new nsElectrumXConnectionPool(
-      mConnectionTimeoutMs, idleTTLMs);
-
-  NMC_LOG("Namecoin resolver initialized: %u servers, timeout=%ums, "
-          "pool_idle_ttl=%us, multi=%s",
-          (unsigned)mServers.Length(), mConnectionTimeoutMs,
-          mCacheTTLSeconds,
-          mQueryMultipleServers ? "true" : "false");
-  return NS_OK;
-}
-
-bool nsNamecoinResolver::IsEnabled() const {
-  MutexAutoLock lock(mMutex);
-  return mEnabled && !mShuttingDown && !mServers.IsEmpty();
-}
-
-void nsNamecoinResolver::Shutdown() {
-  MutexAutoLock lock(mMutex);
-  mShuttingDown = true;
-  mEnabled = false;
-
-  // Shut down the connection pool — closes all open WebSockets.
-  if (mConnectionPool) {
-    // Release lock before pool shutdown to avoid holding two locks
-    RefPtr<nsElectrumXConnectionPool> pool = mConnectionPool;
-    mConnectionPool = nullptr;
-    lock.Unlock();
-    pool->Shutdown();
-  } else {
-    NMC_LOG("Namecoin resolver shut down");
-  }
-}
+// Init(), IsEnabled(), and Shutdown() are defined after
+// nsElectrumXConnectionPool (which they depend on).
 
 // ---------------------------------------------------------------------------
 // ElectrumX WebSocket Connection Pool
@@ -476,6 +404,7 @@ class nsElectrumXPooledConnection final : public nsIWebSocketListener,
   NS_IMETHOD OnAcknowledge(nsISupports* aContext, uint32_t aSize) override;
   NS_IMETHOD OnServerClose(nsISupports* aContext, uint16_t aCode,
                             const nsACString& aReason) override;
+  NS_IMETHOD OnError() override;
 
   // nsITimerCallback
   NS_IMETHOD Notify(nsITimer* aTimer) override;
@@ -543,10 +472,11 @@ nsresult nsElectrumXPooledConnection::EnsureConnected() {
   if (mConnected && !mClosed) return NS_OK;
   if (mClosed) return NS_ERROR_NOT_AVAILABLE;
 
+  fprintf(stderr, "[namecoin] EnsureConnected: opening ws to %s\n", mServerUrl.get());
   NMC_LOG("ElectrumX pool: opening connection to %s", mServerUrl.get());
 
   nsresult rv;
-  mChannel = do_CreateInstance(NS_WEBSOCKETCHANNEL_CONTRACTID, &rv);
+  mChannel = do_CreateInstance("@mozilla.org/network/protocol;1?name=ws", &rv);
   if (NS_FAILED(rv)) {
     NMC_ERR("ElectrumX pool: failed to create WebSocket channel: %08x",
             (unsigned)rv);
@@ -564,7 +494,8 @@ nsresult nsElectrumXPooledConnection::EnsureConnected() {
 
   // AsyncOpen dispatches to the socket transport thread; OnStart fires
   // when the WebSocket handshake completes.
-  rv = mChannel->AsyncOpen(uri, mServerUrl, 0, this, nullptr);
+  mozilla::OriginAttributes attrs;
+  rv = mChannel->AsyncOpenNative(uri, mServerUrl, attrs, 0, this, nullptr);
   if (NS_FAILED(rv)) {
     NMC_ERR("ElectrumX pool: AsyncOpen failed for %s: %08x",
             mServerUrl.get(), (unsigned)rv);
@@ -575,6 +506,8 @@ nsresult nsElectrumXPooledConnection::EnsureConnected() {
   // Wait for OnStart (connection open) or timeout.
   // Monitor::Wait releases the lock, allowing OnStart to acquire it.
   mMonitor.Wait(TimeDuration::FromMilliseconds(mTimeoutMs));
+  fprintf(stderr, "[namecoin] EnsureConnected: wait done, connected=%s\n",
+          mConnected ? "true" : "false");
 
   if (!mConnected) {
     NMC_ERR("ElectrumX pool: connect timeout for %s", mServerUrl.get());
@@ -609,6 +542,8 @@ nsresult nsElectrumXPooledConnection::SendRequest(
           mServerUrl.get(), aReqId);
 
   // SendMsg dispatches to the socket thread internally.
+  fprintf(stderr, "[namecoin] SendRequest: sending id=%d to %s: %s\n",
+          aReqId, mServerUrl.get(), aRequest.get());
   rv = mChannel->SendMsg(aRequest);
   if (NS_FAILED(rv)) {
     NMC_ERR("ElectrumX pool: SendMsg failed for %s: %08x",
@@ -620,6 +555,8 @@ nsresult nsElectrumXPooledConnection::SendRequest(
   // Wait for response. OnMessageAvailable sets mRequestDone and notifies.
   // OnStop/OnServerClose set mClosed on error.
   mMonitor.Wait(TimeDuration::FromMilliseconds(mTimeoutMs));
+  fprintf(stderr, "[namecoin] SendRequest: wait done id=%d done=%s\n",
+          aReqId, mRequestDone ? "true" : "false");
 
   if (!mRequestDone) {
     if (mClosed) {
@@ -678,6 +615,7 @@ void nsElectrumXPooledConnection::ResetIdleTimer() {
 NS_IMETHODIMP nsElectrumXPooledConnection::OnStart(nsISupports* aContext) {
   MonitorAutoLock lock(mMonitor);
   mConnected = true;
+  fprintf(stderr, "[namecoin] OnStart: WebSocket connected to %s\n", mServerUrl.get());
   mMonitor.Notify();
   return NS_OK;
 }
@@ -686,6 +624,8 @@ NS_IMETHODIMP nsElectrumXPooledConnection::OnStop(nsISupports* aContext,
                                                     nsresult aStatusCode) {
   MonitorAutoLock lock(mMonitor);
   NMC_LOG("ElectrumX pool: OnStop for %s: %08x",
+          mServerUrl.get(), (unsigned)aStatusCode);
+  fprintf(stderr, "[namecoin] OnStop: WebSocket closed for %s status=%08x\n",
           mServerUrl.get(), (unsigned)aStatusCode);
   if (!mRequestDone) {
     mCurrentStatus = NS_FAILED(aStatusCode) ? aStatusCode : NS_ERROR_NET_RESET;
@@ -712,6 +652,8 @@ NS_IMETHODIMP nsElectrumXPooledConnection::OnMessageAvailable(
     mRequestDone = true;
     mMonitor.Notify();
   }
+  fprintf(stderr, "[namecoin] OnMessageAvailable: id=%d matched=%s msg_len=%u\n",
+          mCurrentReqId, mRequestDone ? "true" : "false", (unsigned)aMsg.Length());
   // Non-matching messages (e.g. subscription pushes) are silently ignored.
   return NS_OK;
 }
@@ -734,6 +676,20 @@ NS_IMETHODIMP nsElectrumXPooledConnection::OnServerClose(
           nsPromiseFlatCString(aReason).get());
   if (!mRequestDone) {
     mCurrentStatus = NS_ERROR_NET_RESET;
+    mRequestDone = true;
+  }
+  mClosed = true;
+  mConnected = false;
+  mMonitor.NotifyAll();
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsElectrumXPooledConnection::OnError() {
+  MonitorAutoLock lock(mMonitor);
+  NMC_LOG("ElectrumX pool: OnError for %s", mServerUrl.get());
+  fprintf(stderr, "[namecoin] OnError: WebSocket error for %s\n", mServerUrl.get());
+  if (!mRequestDone) {
+    mCurrentStatus = NS_ERROR_FAILURE;
     mRequestDone = true;
   }
   mClosed = true;
@@ -894,6 +850,90 @@ void nsElectrumXConnectionPool::Shutdown() {
 }
 
 // ---------------------------------------------------------------------------
+// nsNamecoinResolver Init / IsEnabled / Shutdown
+// (defined here because they depend on nsElectrumXConnectionPool)
+// ---------------------------------------------------------------------------
+
+nsresult nsNamecoinResolver::Init() {
+  MutexAutoLock lock(mMutex);
+
+  mEnabled = Preferences::GetBool(kPrefEnabled, false);
+  fprintf(stderr, "[namecoin] Init(): enabled=%s\n", mEnabled ? "true" : "false");
+  if (!mEnabled) {
+    NMC_LOG("Namecoin resolver disabled via pref");
+    return NS_OK;
+  }
+
+  // Server list
+  nsAutoCString serversPref;
+  Preferences::GetCString(kPrefServers, serversPref);
+  if (serversPref.IsEmpty()) {
+    serversPref.AssignLiteral(kDefaultServers);
+  }
+
+  // Split comma-separated server list
+  mServers.Clear();
+  nsCCharSeparatedTokenizer tokenizer(serversPref, ',');
+  while (tokenizer.hasMoreTokens()) {
+    nsAutoCString server(tokenizer.nextToken());
+    server.Trim(" \t");
+    if (!server.IsEmpty()) {
+      mServers.AppendElement(server);
+      fprintf(stderr, "[namecoin] Init(): server: %s\n", server.get());
+    }
+  }
+
+  if (mServers.IsEmpty()) {
+    NMC_ERR("Namecoin: no ElectrumX servers configured");
+    mEnabled = false;
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  mCacheTTLSeconds  = Preferences::GetUint(kPrefCacheTTL, 3600);
+  mMaxAliasHops     = Preferences::GetUint(kPrefMaxAlias, 5);
+  mConnectionTimeoutMs = Preferences::GetUint(kPrefTimeout, 10000);
+  mQueryMultipleServers = Preferences::GetBool(kPrefQueryMultiple, false);
+
+  // Create WebSocket connection pool.
+  uint32_t idleTTLMs = mCacheTTLSeconds * 1000;
+  mConnectionPool = new nsElectrumXConnectionPool(
+      mConnectionTimeoutMs, idleTTLMs);
+
+  NMC_LOG("Namecoin resolver initialized: %u servers, timeout=%ums, "
+          "pool_idle_ttl=%us, multi=%s",
+          (unsigned)mServers.Length(), mConnectionTimeoutMs,
+          mCacheTTLSeconds,
+          mQueryMultipleServers ? "true" : "false");
+  fprintf(stderr, "[namecoin] Init(): initialized OK, %u servers, timeout=%ums\n",
+          (unsigned)mServers.Length(), mConnectionTimeoutMs);
+  return NS_OK;
+}
+
+bool nsNamecoinResolver::IsEnabled() const {
+  MutexAutoLock lock(mMutex);
+  return mEnabled && !mShuttingDown && !mServers.IsEmpty();
+}
+
+void nsNamecoinResolver::Shutdown() {
+  RefPtr<nsElectrumXConnectionPool> pool;
+  {
+    MutexAutoLock lock(mMutex);
+    mShuttingDown = true;
+    mEnabled = false;
+
+    // Grab pool ref under lock, then release before calling Shutdown()
+    // to avoid holding two locks.
+    pool = mConnectionPool;
+    mConnectionPool = nullptr;
+  }
+  if (pool) {
+    pool->Shutdown();
+  } else {
+    NMC_LOG("Namecoin resolver shut down");
+  }
+}
+
+// ---------------------------------------------------------------------------
 // JSON-RPC over WebSocket
 // ---------------------------------------------------------------------------
 
@@ -982,9 +1022,11 @@ nsresult nsNamecoinResolver::ElectrumXRequestAny(const nsCString& aMethod,
                                                   const nsCString& aParamsJson,
                                                   nsCString& aResultJson,
                                                   nsCString& aUsedServer) {
-  MutexAutoLock lock(mMutex);
-  nsTArray<nsCString> servers = mServers.Clone();  // snapshot under lock
-  lock.Unlock();  // release before blocking I/O
+  nsTArray<nsCString> servers;
+  {
+    MutexAutoLock lock(mMutex);
+    servers = mServers.Clone();  // snapshot under lock
+  }  // lock released before blocking I/O
 
   for (const auto& server : servers) {
     nsresult rv = ElectrumXRequest(server, aMethod, aParamsJson, aResultJson);
@@ -1016,7 +1058,7 @@ static void ExtractTxHashes(const nsACString& aHistoryJson,
     int32_t pos = aHistoryJson.Find("\"tx_hash\":\"", searchPos);
     if (pos < 0) break;
     int32_t start = pos + 11;  // length of "tx_hash":"
-    nsAutoCString rest = Substring(aHistoryJson, start);
+    nsDependentCSubstring rest = Substring(aHistoryJson, start);
     int32_t end = rest.FindChar('"');
     if (end > 0) {
       aHashes.AppendElement(nsCString(Substring(rest, 0, end)));
@@ -1034,9 +1076,11 @@ nsresult nsNamecoinResolver::ElectrumXRequestValidated(
     return ElectrumXRequestAny(aMethod, aParamsJson, aResultJson, aUsedServer);
   }
 
-  MutexAutoLock lock(mMutex);
-  nsTArray<nsCString> servers = mServers.Clone();
-  lock.Unlock();
+  nsTArray<nsCString> servers;
+  {
+    MutexAutoLock lock(mMutex);
+    servers = mServers.Clone();
+  }
 
   // Query all servers and collect results
   struct ServerResult {
@@ -1175,7 +1219,7 @@ nsresult nsNamecoinResolver::GetCurrentBlockHeight(uint32_t& aHeight) {
     aHeight = 0;
     return NS_ERROR_FAILURE;
   }
-  nsAutoCString heightStr = Substring(result, pos + 9);
+  nsDependentCSubstring heightStr = Substring(result, pos + 9);
   // Find first non-digit
   uint32_t end = 0;
   while (end < heightStr.Length() && IsAsciiDigit(heightStr[end])) end++;
@@ -1432,13 +1476,13 @@ static void NmcExtractSubdomainLabels(const nsACString& aLower,
                                        const nsACString& aApex,
                                        nsTArray<nsCString>& aLabels) {
   // Strip .bit suffix
-  nsAutoCString without = Substring(aLower, 0, aLower.Length() - 4);
+  nsDependentCSubstring without = Substring(aLower, 0, aLower.Length() - 4);
   // Expected suffix: ".<apex>"
   nsAutoCString suffix;
   suffix.Append('.');
   suffix.Append(aApex);
   if (!StringEndsWith(without, suffix)) return;  // apex only, no subdomains
-  nsAutoCString subPart = Substring(without, 0, without.Length() - suffix.Length());
+  nsDependentCSubstring subPart = Substring(without, 0, without.Length() - suffix.Length());
   if (subPart.IsEmpty()) return;
   nsCCharSeparatedTokenizer tok(subPart, '.');
   while (tok.hasMoreTokens()) {
@@ -1459,7 +1503,7 @@ nsresult nsNamecoinResolver::ParseNameValue(const nsACString& aValueJson,
   /**
    * Parse the Namecoin d/ name value JSON.
    *
-   * Full spec: SPEC.md Section 3.
+   * Full spec: firefox2.txt Section 3.
    * Reference: tls-namecoin-ext/background/namecoin-resolver.js (parseNameValue)
    *            tls-namecoin-ext/background/dns-router.js (subdomain map traversal)
    *
@@ -1510,7 +1554,7 @@ nsresult nsNamecoinResolver::ParseNameValue(const nsACString& aValueJson,
   // Extract apex and subdomain labels from hostname
   nsAutoCString lower(aHostname);
   ToLowerCase(lower);
-  nsAutoCString withoutBit = Substring(lower, 0, lower.Length() - 4);
+  nsDependentCSubstring withoutBit = Substring(lower, 0, lower.Length() - 4);
   int32_t dotPos = withoutBit.RFindChar('.');
   nsAutoCString apex;
   if (dotPos >= 0) {
@@ -1611,6 +1655,8 @@ nsresult nsNamecoinResolver::ResolveInternal(const nsACString& aHostname,
    */
 
   MOZ_ASSERT(!NS_IsMainThread());
+  fprintf(stderr, "[namecoin] ResolveInternal: START %s\n",
+          nsPromiseFlatCString(aHostname).get());
 
   if (!IsNamecoinHost(aHostname)) {
     aResult.error.AssignLiteral("Not a .bit hostname");
@@ -1623,7 +1669,7 @@ nsresult nsNamecoinResolver::ResolveInternal(const nsACString& aHostname,
   ToLowerCase(lower);
 
   // Remove .bit
-  nsAutoCString withoutBit = Substring(lower, 0, lower.Length() - 4);
+  nsDependentCSubstring withoutBit = Substring(lower, 0, lower.Length() - 4);
 
   // Find apex (last label before .bit)
   int32_t dotPos = withoutBit.RFindChar('.');
@@ -1645,6 +1691,7 @@ nsresult nsNamecoinResolver::ResolveInternal(const nsACString& aHostname,
   nsAutoCString scripthash;
   nsresult rv = ComputeScripthash(namePath, scripthash);
   NS_ENSURE_SUCCESS(rv, rv);
+  fprintf(stderr, "[namecoin] ResolveInternal: scripthash=%s\n", scripthash.get());
 
   // Step 3: Query history
   nsAutoCString historyParams;
@@ -1675,18 +1722,19 @@ nsresult nsNamecoinResolver::ResolveInternal(const nsACString& aHostname,
     while (true) {
       int32_t heightPos = h.Find("\"height\":", searchPos);
       if (heightPos < 0) break;
-      nsAutoCString rest = Substring(h, heightPos + 9);
+      nsDependentCSubstring rest = Substring(h, heightPos + 9);
       nsresult dummy;
       uint32_t height = (uint32_t)rest.ToInteger64(&dummy);
       if (NS_SUCCEEDED(dummy) && height > bestHeight) {
         // Find the tx_hash for this entry (scan back in the current JSON object)
         int32_t objStart = h.RFindChar('{', heightPos);
         if (objStart >= 0) {
-          nsAutoCString obj = Substring(h, objStart,
-                                         h.FindChar('}', objStart) - objStart + 1);
+          nsAutoCString obj;
+          obj = Substring(h, objStart,
+                          h.FindChar('}', objStart) - objStart + 1);
           int32_t txPos = obj.Find("\"tx_hash\":\"");
           if (txPos >= 0) {
-            nsAutoCString txRest = Substring(obj, txPos + 11);
+            nsDependentCSubstring txRest = Substring(obj, txPos + 11);
             int32_t txEnd = txRest.FindChar('"');
             if (txEnd > 0) {
               bestHeight = height;
@@ -1712,6 +1760,8 @@ nsresult nsNamecoinResolver::ResolveInternal(const nsACString& aHostname,
 
   NMC_LOG("ResolveInternal: best tx=%s at height=%u",
           bestTxHash.get(), bestHeight);
+  fprintf(stderr, "[namecoin] ResolveInternal: history done, bestTx=%s height=%u\n",
+          bestTxHash.get(), bestHeight);
 
   // Step 5: Fetch verbose transaction
   nsAutoCString txParams;
@@ -1728,6 +1778,7 @@ nsresult nsNamecoinResolver::ResolveInternal(const nsACString& aHostname,
             bestTxHash.get());
     return NS_ERROR_NAMECOIN_SERVERS_UNREACHABLE;
   }
+  fprintf(stderr, "[namecoin] ResolveInternal: tx fetched len=%u\n", (unsigned)txJson.Length());
 
   // Step 6: Current block height for expiry
   uint32_t currentHeight = 0;
@@ -1754,7 +1805,8 @@ nsresult nsNamecoinResolver::ResolveInternal(const nsACString& aHostname,
     while (true) {
       int32_t hexPos = tx.Find("\"hex\":\"", searchPos);
       if (hexPos < 0) break;
-      nsAutoCString scriptHex = Substring(tx, hexPos + 7);
+      nsAutoCString scriptHex;
+      scriptHex = Substring(tx, hexPos + 7);
       int32_t end = scriptHex.FindChar('"');
       if (end > 0) {
         scriptHex.Truncate(end);
@@ -1777,10 +1829,13 @@ nsresult nsNamecoinResolver::ResolveInternal(const nsACString& aHostname,
     aResult.error.AssignLiteral("Could not decode name value from transaction");
     return NS_ERROR_FAILURE;
   }
+  fprintf(stderr, "[namecoin] ResolveInternal: nameValue='%s'\n", nameValue.get());
 
   // Step 9: Parse value JSON
   rv = ParseNameValue(nameValue, aHostname, aResult.nameValue);
   NS_ENSURE_SUCCESS(rv, rv);
+  fprintf(stderr, "[namecoin] ResolveInternal: parsed ip=%s ip6=%s\n",
+          aResult.nameValue.ip.get(), aResult.nameValue.ip6.get());
 
   // Step 10: Follow alias if needed
   if (!aResult.nameValue.alias.IsEmpty() && mMaxAliasHops > 0) {
@@ -1836,6 +1891,10 @@ nsresult nsNamecoinResolver::ResolveInternal(const nsACString& aHostname,
   aResult.resolved = true;
   NMC_LOG("ResolveInternal: success for %s, ttl=%us",
           nsPromiseFlatCString(aHostname).get(), aResult.ttlSeconds);
+  fprintf(stderr, "[namecoin] ResolveInternal: SUCCESS %s ip=%s ip6=%s ttl=%us\n",
+          nsPromiseFlatCString(aHostname).get(),
+          aResult.nameValue.ip.get(), aResult.nameValue.ip6.get(),
+          aResult.ttlSeconds);
   return NS_OK;
 }
 
@@ -1887,7 +1946,7 @@ nsresult nsNamecoinResolver::Resolve(const nsACString& aHostname,
         // Fire callback on the main thread (or current thread if off-main)
         nsCOMPtr<nsIRunnable> cb = NS_NewRunnableFunction(
             "nsNamecoinResolver::ResolveCallback",
-            [aCallback, result]() mutable {
+            [aCallback, result = std::move(result)]() mutable {
               aCallback->OnNamecoinResolved(result);
             });
 
@@ -1898,9 +1957,9 @@ nsresult nsNamecoinResolver::Resolve(const nsACString& aHostname,
         }
       });
 
-  nsCOMPtr<nsIEventTarget> pool = GetMediumHighPriorityThreadPool();
-  if (!pool) pool = GetCurrentSerialEventTarget();
-  return pool->Dispatch(runnable, NS_DISPATCH_NORMAL);
+  nsCOMPtr<nsIEventTarget> target = GetCurrentSerialEventTarget();
+  if (!target) target = do_GetMainThread();
+  return target->Dispatch(runnable, NS_DISPATCH_NORMAL);
 }
 
 // ---------------------------------------------------------------------------

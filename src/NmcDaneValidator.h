@@ -30,7 +30,7 @@
  *
  * Reference:
  *   RFC 6698 — The DNS-Based Authentication of Named Entities (DANE)
- *   SPEC.md Section 5 — TLS/NSS Integration
+ *   firefox2.txt Section 5 — TLS/NSS Integration
  *   Namecoin safetlsa / ncp11 (Go reference implementations)
  *
  * Controlled by about:config:

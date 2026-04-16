@@ -44,16 +44,21 @@
 #include "nsTArray.h"
 #include "nsISupports.h"
 #include "mozilla/RefPtr.h"
+#include "mozilla/UniquePtr.h"
 #include "mozilla/Mutex.h"
 #include "mozilla/net/DNS.h"
 #include "nsITimer.h"
 #include "mozilla/Monitor.h"
+#include "NmcDaneValidator.h"
 
 namespace mozilla {
 namespace net {
 
-// Forward declaration — defined in nsNamecoinResolver.cpp
+// Forward declarations — defined in nsNamecoinResolver.cpp
 class nsElectrumXConnectionPool;
+
+// Forward declaration — Phase 2 DANE validation cache
+class NmcDaneCache;
 
 // ---------------------------------------------------------------------------
 // Parsed Namecoin name value (d/ namespace JSON)
@@ -97,8 +102,11 @@ struct NamecoinResolveResult {
   uint32_t updateHeight = 0;
   nsCString txHash;
 
-  // Full value (for TLSA etc. — used by Phase 2)
+  // Full value (for TLSA/DANE validation)
   NamecoinNameValue nameValue;
+
+  // HTTPS-only flag: set when TLSA records exist and require_tls pref is true
+  bool httpsOnly = false;
 
   // Suggested cache TTL in seconds
   uint32_t ttlSeconds = 3600;
@@ -218,6 +226,24 @@ class nsNamecoinResolver final {
    */
   static bool IsNamecoinHost(const nsACString& aHostname);
 
+  /**
+   * Get the DANE validation cache (Phase 2).
+   * Returns nullptr if resolver is not initialized.
+   */
+  NmcDaneCache* GetDaneCache() const;
+
+  /**
+   * Get TLSA records applicable for a specific port.
+   * Checks port-specific records (_tcp._<port>) before top-level tls array.
+   *
+   * @param aNameValue  Parsed Namecoin name value
+   * @param aPort       TCP port number (e.g. 443)
+   * @param aRecords    Output: applicable TLSA records
+   */
+  static void GetTlsaForPort(const NamecoinNameValue& aNameValue,
+                             uint16_t aPort,
+                             nsTArray<NamecoinTLSARecord>& aRecords);
+
  private:
   ~nsNamecoinResolver();
 
@@ -257,9 +283,15 @@ class nsNamecoinResolver final {
   uint32_t mMaxAliasHops = 5;
   uint32_t mConnectionTimeoutMs = 10000;
   bool mQueryMultipleServers = false;
+  bool mRequireTLS = true;  // Phase 2: force HTTPS when TLSA records exist
 
   // WebSocket connection pool (reuses connections across ElectrumX requests)
   RefPtr<nsElectrumXConnectionPool> mConnectionPool;
+
+  // Phase 2: DANE-TLSA validation cache
+  // Caches cert validation results to avoid repeated crypto operations.
+  // Key: "domain:cert_sha256_hex", TTL from network.namecoin.cache_ttl_seconds
+  UniquePtr<NmcDaneCache> mDaneCache;
 };
 
 }  // namespace net

@@ -25,7 +25,7 @@
  *   Namecoin safetlsa (Go) — X.509 cert generation from TLSA
  *   Namecoin ncp11 (Go)    — PKCS#11 module for NSS
  *   RFC 6698                — DANE protocol specification
- *   SPEC.md Section 5  — Integration spec
+ *   firefox2.txt Section 5  — Integration spec
  */
 
 #include "NmcDaneValidator.h"
