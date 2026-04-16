@@ -50,18 +50,23 @@
 #include "mozilla/Logging.h"
 #include "mozilla/Monitor.h"
 #include "mozilla/Preferences.h"
+#include "mozilla/StaticPrefs_network.h"
+// nsContentUtils/nsILoadInfo/nsIContentPolicy no longer needed (removed nsIWebSocketChannel)
 #include "mozilla/Base64.h"
 #include "mozilla/ScopeExit.h"
 #include "nsThreadUtils.h"
 #include "nsNetUtil.h"
 #include "nsIIOService.h"
-#include "nsIWebSocketChannel.h"
-#include "nsIWebSocketListener.h"
+// nsIWebSocketChannel/Listener no longer used (replaced by NSPR sockets)
 #include "nsIEventTarget.h"
 #include "nsServiceManagerUtils.h"
 #include "mozilla/OriginAttributes.h"
 #include "nsString.h"
-#include "prnetdb.h"          // PR_StringToNetAddr
+#include "prnetdb.h"          // PR_StringToNetAddr, PR_GetHostByName
+#include "prio.h"              // PR_OpenTCPSocket, PR_Connect, PR_Send, PR_Recv, PR_Close
+#include "prcvar.h"            // PRCondVar (unused but available)
+#include "prtime.h"            // PR_Now (unused but available)
+#include "prerror.h"           // PR_GetError
 
 // NSS (for SHA-256)
 #include "sechash.h"          // HASH_HashBuf, HASH_SHA256
@@ -96,8 +101,13 @@ static constexpr uint8_t  kOpReturn      = 0x6a;
 static constexpr uint8_t  kOpPushData1   = 0x4c;
 static constexpr uint8_t  kOpPushData2   = 0x4d;
 
-// Default server list (comma-separated in pref)
-static constexpr char kDefaultServers[]  = "ws://electrumx.testls.space:50003";
+// Default server list (comma-separated in pref).
+// Use IP address directly to avoid DNS deadlock: when the DNS resolver thread
+// runs ResolveSync() it dispatches WebSocket open to the main thread, which
+// would then need to resolve the ElectrumX hostname back through the DNS
+// resolver — causing a deadlock. Using an IP bypasses DNS entirely.
+// electrumx.testls.space resolves to 162.212.154.52.
+static constexpr char kDefaultServers[]  = "ws://162.212.154.52:50003";
 
 // ---------------------------------------------------------------------------
 // Hex utilities
@@ -324,387 +334,374 @@ nsNamecoinResolver::~nsNamecoinResolver() { Shutdown(); }
 // ElectrumX WebSocket Connection Pool
 // ---------------------------------------------------------------------------
 //
-// Mirrors the single-connection-per-server pattern from the JS reference
-// implementation (electrumx-ws.js). Instead of opening a new WebSocket for
-// every JSON-RPC request, we maintain a pool of persistent connections keyed
-// by server URL.
+// Uses NSPR blocking TCP sockets with manual WebSocket (RFC 6455) framing.
+// This is completely thread-safe (no main-thread requirement, no Gecko
+// WebSocketChannel admission manager, no FailDelay backoff).
 //
 // Architecture:
 //   nsElectrumXConnectionPool (1 per resolver)
 //     └─ nsElectrumXPooledConnection (1 per server URL)
-//          └─ nsIWebSocketChannel (persistent, reused across requests)
+//          └─ PRFileDesc* (NSPR TCP socket, blocking I/O)
 //
-// Threading: resolver thread pool threads call Pool::Request() which
-// serializes per-connection via Monitor. WebSocket callbacks fire on the
-// socket transport thread and notify the blocked caller.
-//
-// Idle cleanup: each connection starts an nsITimer after the last request.
-// If no new request arrives within cache_ttl_seconds, the timer fires on
-// the main thread and closes the connection. Next request creates a new one.
+// Threading: DNS resolver threads call Pool::Request() directly.
+//            NSPR sockets may be used from any thread without restriction.
 // ---------------------------------------------------------------------------
 
 /**
  * nsElectrumXPooledConnection — Persistent WebSocket to one ElectrumX server.
  *
- * Keeps the WebSocket open between requests, avoiding repeated TCP+WS
- * handshake overhead. A single .bit resolve does 3 requests (history + tx +
- * headers) — with pooling all 3 reuse the same connection.
+ * Uses NSPR blocking TCP sockets with manual WebSocket framing (RFC 6455).
+ * No main-thread requirement, no Gecko WebSocketChannel, no FailDelay backoff.
  *
- * The connection is serialized: only one JSON-RPC request in-flight at a
- * time per connection (via Monitor). This matches the ElectrumX protocol
- * semantics (responses arrive in request order for a single connection).
- *
- * Lifecycle: created by pool → connects on first request → stays open →
- * closed after idle TTL or on error → pool replaces with new instance.
+ * Threading: safe to call from any thread including DNS resolver threads.
  */
-class nsElectrumXPooledConnection final : public nsIWebSocketListener,
-                                           public nsITimerCallback,
-                                           public nsINamed {
+class nsElectrumXPooledConnection final {
  public:
-  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(nsElectrumXPooledConnection)
 
   nsElectrumXPooledConnection(const nsCString& aServerUrl,
-                               uint32_t aTimeoutMs,
-                               uint32_t aIdleTTLMs)
-      : mMonitor("nsElectrumXPooledConnection"),
-        mServerUrl(aServerUrl),
+                               uint32_t aTimeoutMs)
+      : mServerUrl(aServerUrl),
         mTimeoutMs(aTimeoutMs),
-        mIdleTTLMs(aIdleTTLMs) {}
+        mFd(nullptr),
+        mClosed(false) {}
 
   /**
-   * Send a JSON-RPC request and block until response.
-   * Thread-safe; serializes concurrent callers via Monitor.
-   * Opens the WebSocket lazily on first call.
-   *
-   * @param aReqId    Unique request ID (for response matching)
-   * @param aRequest  Full JSON-RPC request string
-   * @param aResultJson  Output: raw JSON-RPC response message
+   * Send one JSON-RPC request, block until response arrives.
+   * Thread-safe. Opens/reuses the TCP+WS connection.
    */
   nsresult SendRequest(int32_t aReqId,
                        const nsCString& aRequest,
                        nsCString& aResultJson);
 
-  bool IsClosed() {
-    MonitorAutoLock lock(mMonitor);
-    return mClosed;
-  }
+  bool IsClosed() const { return mClosed; }
 
   void Close() {
-    MonitorAutoLock lock(mMonitor);
-    CloseWithLock();
-  }
-
-  // nsIWebSocketListener
-  NS_IMETHOD OnStart(nsISupports* aContext) override;
-  NS_IMETHOD OnStop(nsISupports* aContext, nsresult aStatusCode) override;
-  NS_IMETHOD OnMessageAvailable(nsISupports* aContext,
-                                 const nsACString& aMsg) override;
-  NS_IMETHOD OnBinaryMessageAvailable(nsISupports* aContext,
-                                       const nsACString& aMsg) override;
-  NS_IMETHOD OnAcknowledge(nsISupports* aContext, uint32_t aSize) override;
-  NS_IMETHOD OnServerClose(nsISupports* aContext, uint16_t aCode,
-                            const nsACString& aReason) override;
-  NS_IMETHOD OnError() override;
-
-  // nsITimerCallback
-  NS_IMETHOD Notify(nsITimer* aTimer) override;
-
-  // nsINamed
-  NS_IMETHOD GetName(nsACString& aName) override {
-    aName.AssignLiteral("nsElectrumXPooledConnection");
-    return NS_OK;
+    if (mFd) {
+      PR_Close(mFd);
+      mFd = nullptr;
+    }
+    mClosed = true;
   }
 
  private:
-  ~nsElectrumXPooledConnection() {
-    if (mIdleTimer) {
-      mIdleTimer->Cancel();
+  ~nsElectrumXPooledConnection() { Close(); }
+
+  nsresult EnsureConnected();
+  nsresult SendFrame(const nsCString& aData);
+  nsresult RecvFrame(nsCString& aData);
+
+  // Parse "ws://host:port/path" → host, port, path
+  bool ParseUrl(const nsCString& aUrl,
+                nsCString& aHost, int32_t& aPort, nsCString& aPath) {
+    // Expect ws://host:port[/path]
+    nsAutoCString url(aUrl);
+    if (!StringBeginsWith(url, "ws://"_ns)) return false;
+    url = Substring(url, 5);  // strip "ws://"
+
+    int32_t slashPos = url.FindChar('/');
+    nsAutoCString hostPort;
+    if (slashPos >= 0) {
+      hostPort = Substring(url, 0, slashPos);
+      aPath = Substring(url, slashPos);
+    } else {
+      hostPort = url;
+      aPath.AssignLiteral("/");
     }
+
+    int32_t colonPos = hostPort.FindChar(':');
+    if (colonPos >= 0) {
+      aHost = Substring(hostPort, 0, colonPos);
+      nsAutoCString portStr(Substring(hostPort, colonPos + 1));
+      aPort = atoi(portStr.get());
+    } else {
+      aHost = hostPort;
+      aPort = 80;
+    }
+    return !aHost.IsEmpty() && aPort > 0;
   }
 
-  nsresult EnsureConnected();  // called with mMonitor held
-  void ResetIdleTimer();       // called with mMonitor held
-  void CloseWithLock();        // called with mMonitor held
-
-  Monitor mMonitor;
   nsCString mServerUrl;
   uint32_t mTimeoutMs;
-  uint32_t mIdleTTLMs;
-
-  // Connection state (guarded by mMonitor)
-  nsCOMPtr<nsIWebSocketChannel> mChannel;
-  bool mConnected = false;
-  bool mClosed = false;
-
-  // Current in-flight request (guarded by mMonitor, one at a time)
-  int32_t mCurrentReqId = -1;
-  nsCString mCurrentResult;
-  nsresult mCurrentStatus = NS_ERROR_NOT_INITIALIZED;
-  bool mRequestDone = false;
-
-  // Idle timeout timer
-  nsCOMPtr<nsITimer> mIdleTimer;
+  PRFileDesc* mFd;         // NSPR TCP socket (blocking)
+  bool mClosed;
+  // No mutex needed: pool serializes access per-connection
 };
 
-NS_IMPL_ISUPPORTS(nsElectrumXPooledConnection,
-                   nsIWebSocketListener,
-                   nsITimerCallback,
-                   nsINamed)
-
-void nsElectrumXPooledConnection::CloseWithLock() {
-  // Must be called with mMonitor held
-  if (mClosed) return;
-  mClosed = true;
-  if (mIdleTimer) {
-    mIdleTimer->Cancel();
-    mIdleTimer = nullptr;
-  }
-  if (mChannel) {
-    mChannel->Close(1000, "shutdown"_ns);
-    mChannel = nullptr;
-  }
-  mMonitor.NotifyAll();
-}
-
 nsresult nsElectrumXPooledConnection::EnsureConnected() {
-  // Called with mMonitor held (via MonitorAutoLock in SendRequest).
-  // If not yet connected, opens the WebSocket and waits for OnStart.
-  if (mConnected && !mClosed) return NS_OK;
+  if (mFd && !mClosed) return NS_OK;
   if (mClosed) return NS_ERROR_NOT_AVAILABLE;
 
-  fprintf(stderr, "[namecoin] EnsureConnected: opening ws to %s\n", mServerUrl.get());
-  NMC_LOG("ElectrumX pool: opening connection to %s", mServerUrl.get());
-
-  nsresult rv;
-  mChannel = do_CreateInstance("@mozilla.org/network/protocol;1?name=ws", &rv);
-  if (NS_FAILED(rv)) {
-    NMC_ERR("ElectrumX pool: failed to create WebSocket channel: %08x",
-            (unsigned)rv);
+  nsCString host, path;
+  int32_t port;
+  if (!ParseUrl(mServerUrl, host, port, path)) {
+    fprintf(stderr, "[namecoin] EnsureConnected: bad URL: %s\n", mServerUrl.get());
     mClosed = true;
-    return rv;
+    return NS_ERROR_MALFORMED_URI;
   }
 
-  nsCOMPtr<nsIURI> uri;
-  rv = NS_NewURI(getter_AddRefs(uri), mServerUrl);
-  if (NS_FAILED(rv)) {
-    NMC_ERR("ElectrumX pool: invalid server URL %s", mServerUrl.get());
-    mClosed = true;
-    return rv;
-  }
+  fprintf(stderr, "[namecoin] EnsureConnected: TCP connect to %s:%d%s\n",
+          host.get(), port, path.get());
 
-  // AsyncOpen dispatches to the socket transport thread; OnStart fires
-  // when the WebSocket handshake completes.
-  mozilla::OriginAttributes attrs;
-  rv = mChannel->AsyncOpenNative(uri, mServerUrl, attrs, 0, this, nullptr);
-  if (NS_FAILED(rv)) {
-    NMC_ERR("ElectrumX pool: AsyncOpen failed for %s: %08x",
-            mServerUrl.get(), (unsigned)rv);
-    mClosed = true;
-    return rv;
-  }
+  // Resolve host → IP address
+  PRNetAddr addr;
+  memset(&addr, 0, sizeof(addr));
 
-  // Wait for OnStart (connection open) or timeout.
-  // Monitor::Wait releases the lock, allowing OnStart to acquire it.
-  mMonitor.Wait(TimeDuration::FromMilliseconds(mTimeoutMs));
-  fprintf(stderr, "[namecoin] EnsureConnected: wait done, connected=%s\n",
-          mConnected ? "true" : "false");
-
-  if (!mConnected) {
-    NMC_ERR("ElectrumX pool: connect timeout for %s", mServerUrl.get());
-    mClosed = true;
-    if (mChannel) {
-      mChannel->Close(1000, "timeout"_ns);
-      mChannel = nullptr;
+  // Try literal IP first
+  if (PR_StringToNetAddr(host.get(), &addr) != PR_SUCCESS) {
+    // Not a literal IP — do hostname lookup (blocking)
+    char buf[PR_NETDB_BUF_SIZE];
+    PRHostEnt he;
+    if (PR_GetHostByName(host.get(), buf, sizeof(buf), &he) != PR_SUCCESS) {
+      fprintf(stderr, "[namecoin] EnsureConnected: DNS lookup failed for %s\n", host.get());
+      mClosed = true;
+      return NS_ERROR_UNKNOWN_HOST;
     }
-    return NS_ERROR_NET_TIMEOUT;
+    PR_EnumerateHostEnt(0, &he, 0, &addr);
+  }
+  PR_SetNetAddr(PR_IpAddrNull, PR_AF_INET, (PRUint16)port, &addr);
+
+  // Open TCP socket
+  mFd = PR_OpenTCPSocket(PR_AF_INET);
+  if (!mFd) {
+    fprintf(stderr, "[namecoin] EnsureConnected: PR_OpenTCPSocket failed\n");
+    mClosed = true;
+    return NS_ERROR_FAILURE;
   }
 
-  NMC_LOG("ElectrumX pool: connected to %s", mServerUrl.get());
+  // Set timeout
+  PRIntervalTime timeout = PR_MillisecondsToInterval(mTimeoutMs);
+  if (PR_Connect(mFd, &addr, timeout) != PR_SUCCESS) {
+    PRErrorCode err = PR_GetError();
+    fprintf(stderr, "[namecoin] EnsureConnected: PR_Connect failed: %d\n", (int)err);
+    PR_Close(mFd);
+    mFd = nullptr;
+    mClosed = true;
+    return NS_ERROR_CONNECTION_REFUSED;
+  }
+
+  fprintf(stderr, "[namecoin] EnsureConnected: TCP connected, doing WS handshake\n");
+
+  // --- WebSocket Handshake (RFC 6455) ---
+  // Generate a random 16-byte key and base64-encode it
+  uint8_t keyBytes[16];
+  for (int i = 0; i < 16; i++) keyBytes[i] = (uint8_t)(rand() & 0xff);
+  nsCString keyB64;
+  nsresult rv = mozilla::Base64Encode(
+      nsDependentCSubstring(reinterpret_cast<const char*>(keyBytes), 16),
+      keyB64);
+  if (NS_FAILED(rv)) {
+    Close();
+    return rv;
+  }
+
+  // Build HTTP upgrade request
+  nsAutoCString req;
+  req.AppendLiteral("GET ");
+  req.Append(path);
+  req.AppendLiteral(" HTTP/1.1\r\nHost: ");
+  req.Append(host);
+  req.Append(':');
+  req.AppendInt(port);
+  req.AppendLiteral("\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                    "Sec-WebSocket-Key: ");
+  req.Append(keyB64);
+  req.AppendLiteral("\r\nSec-WebSocket-Version: 13\r\n\r\n");
+
+  // Send HTTP upgrade
+  PRInt32 sent = PR_Send(mFd, req.get(), req.Length(), 0, timeout);
+  if (sent != (PRInt32)req.Length()) {
+    fprintf(stderr, "[namecoin] EnsureConnected: send failed, sent=%d expected=%u\n",
+            (int)sent, (unsigned)req.Length());
+    Close();
+    return NS_ERROR_FAILURE;
+  }
+
+  // Read HTTP response until \r\n\r\n
+  nsAutoCString response;
+  char rbuf[1];
+  while (true) {
+    PRInt32 n = PR_Recv(mFd, rbuf, 1, 0, timeout);
+    if (n <= 0) {
+      fprintf(stderr, "[namecoin] EnsureConnected: recv failed during handshake\n");
+      Close();
+      return NS_ERROR_FAILURE;
+    }
+    response.Append(rbuf[0]);
+    if (StringEndsWith(response, "\r\n\r\n"_ns)) break;
+    if (response.Length() > 4096) {
+      fprintf(stderr, "[namecoin] EnsureConnected: response too large\n");
+      Close();
+      return NS_ERROR_FAILURE;
+    }
+  }
+
+  if (!StringBeginsWith(response, "HTTP/1.1 101"_ns)) {
+    fprintf(stderr, "[namecoin] EnsureConnected: WS upgrade rejected: %s\n",
+            response.get());
+    Close();
+    return NS_ERROR_FAILURE;
+  }
+
+  fprintf(stderr, "[namecoin] OnStart: WebSocket connected to %s\n", mServerUrl.get());
   return NS_OK;
 }
 
-nsresult nsElectrumXPooledConnection::SendRequest(
-    int32_t aReqId, const nsCString& aRequest, nsCString& aResultJson) {
-  // MonitorAutoLock serializes concurrent callers — only one request
-  // in-flight per connection at any time.
-  MonitorAutoLock lock(mMonitor);
+nsresult nsElectrumXPooledConnection::SendFrame(const nsCString& aData) {
+  // RFC 6455 client frame: FIN=1, opcode=1 (text), MASK=1, masking key, data
+  uint32_t dataLen = aData.Length();
+  PRIntervalTime timeout = PR_MillisecondsToInterval(mTimeoutMs);
 
+  // Build frame header
+  nsTArray<uint8_t> frame;
+  frame.AppendElement(0x81);  // FIN + opcode text
+
+  uint8_t maskBit = 0x80;  // MASK bit set (client must mask)
+  if (dataLen < 126) {
+    frame.AppendElement((uint8_t)(dataLen | maskBit));
+  } else if (dataLen <= 0xffff) {
+    frame.AppendElement(126 | maskBit);
+    frame.AppendElement((uint8_t)(dataLen >> 8));
+    frame.AppendElement((uint8_t)(dataLen & 0xff));
+  } else {
+    frame.AppendElement(127 | maskBit);
+    for (int i = 7; i >= 0; i--) {
+      frame.AppendElement((uint8_t)((dataLen >> (i * 8)) & 0xff));
+    }
+  }
+
+  // 4-byte random masking key
+  uint8_t mask[4];
+  for (int i = 0; i < 4; i++) mask[i] = (uint8_t)(rand() & 0xff);
+  frame.AppendElements(mask, 4);
+
+  // Masked payload
+  const uint8_t* src = reinterpret_cast<const uint8_t*>(aData.get());
+  for (uint32_t i = 0; i < dataLen; i++) {
+    frame.AppendElement(src[i] ^ mask[i % 4]);
+  }
+
+  PRInt32 sent = PR_Send(mFd, frame.Elements(), frame.Length(), 0, timeout);
+  if (sent != (PRInt32)frame.Length()) {
+    fprintf(stderr, "[namecoin] SendFrame: send failed\n");
+    return NS_ERROR_FAILURE;
+  }
+  return NS_OK;
+}
+
+nsresult nsElectrumXPooledConnection::RecvFrame(nsCString& aData) {
+  // Read one WebSocket frame from the server (server frames are unmasked)
+  PRIntervalTime timeout = PR_MillisecondsToInterval(mTimeoutMs);
+
+  auto recvN = [&](uint8_t* buf, uint32_t n) -> bool {
+    uint32_t received = 0;
+    while (received < n) {
+      PRInt32 r = PR_Recv(mFd, buf + received, n - received, 0, timeout);
+      if (r <= 0) return false;
+      received += r;
+    }
+    return true;
+  };
+
+  // Read 2 header bytes
+  uint8_t header[2];
+  if (!recvN(header, 2)) {
+    fprintf(stderr, "[namecoin] RecvFrame: failed to read header\n");
+    return NS_ERROR_FAILURE;
+  }
+
+  // uint8_t fin_opcode = header[0];
+  uint8_t len_byte = header[1];
+  bool masked = (len_byte & 0x80) != 0;
+  uint64_t payloadLen = len_byte & 0x7f;
+
+  if (payloadLen == 126) {
+    uint8_t ext[2];
+    if (!recvN(ext, 2)) return NS_ERROR_FAILURE;
+    payloadLen = ((uint64_t)ext[0] << 8) | ext[1];
+  } else if (payloadLen == 127) {
+    uint8_t ext[8];
+    if (!recvN(ext, 8)) return NS_ERROR_FAILURE;
+    payloadLen = 0;
+    for (int i = 0; i < 8; i++) payloadLen = (payloadLen << 8) | ext[i];
+  }
+
+  uint8_t mask[4] = {0,0,0,0};
+  if (masked) {
+    if (!recvN(mask, 4)) return NS_ERROR_FAILURE;
+  }
+
+  if (payloadLen > 1024 * 1024) {  // 1 MB safety limit
+    fprintf(stderr, "[namecoin] RecvFrame: frame too large (%llu bytes)\n",
+            (unsigned long long)payloadLen);
+    return NS_ERROR_FAILURE;
+  }
+
+  nsTArray<uint8_t> payload;
+  payload.SetLength((uint32_t)payloadLen);
+  if (payloadLen > 0 && !recvN(payload.Elements(), (uint32_t)payloadLen)) {
+    fprintf(stderr, "[namecoin] RecvFrame: failed to read payload\n");
+    return NS_ERROR_FAILURE;
+  }
+
+  if (masked) {
+    for (uint32_t i = 0; i < payloadLen; i++) {
+      payload[i] ^= mask[i % 4];
+    }
+  }
+
+  aData.Assign(reinterpret_cast<const char*>(payload.Elements()),
+               (uint32_t)payloadLen);
+  return NS_OK;
+}
+
+nsresult nsElectrumXPooledConnection::SendRequest(int32_t aReqId,
+                                                   const nsCString& aRequest,
+                                                   nsCString& aResultJson) {
+  // Connect if not already open
   nsresult rv = EnsureConnected();
   if (NS_FAILED(rv)) return rv;
 
-  // Set up request tracking
-  mCurrentReqId = aReqId;
-  mCurrentResult.Truncate();
-  mCurrentStatus = NS_ERROR_NET_TIMEOUT;
-  mRequestDone = false;
-
-  NMC_LOG("ElectrumX pool → %s (id=%d): sending on pooled connection",
-          mServerUrl.get(), aReqId);
-
-  // SendMsg dispatches to the socket thread internally.
-  fprintf(stderr, "[namecoin] SendRequest: sending id=%d to %s: %s\n",
-          aReqId, mServerUrl.get(), aRequest.get());
-  rv = mChannel->SendMsg(aRequest);
+  // Send the request as a WebSocket text frame
+  fprintf(stderr, "[namecoin] SendRequest: id=%d request=%s\n",
+          aReqId, aRequest.get());
+  rv = SendFrame(aRequest);
   if (NS_FAILED(rv)) {
-    NMC_ERR("ElectrumX pool: SendMsg failed for %s: %08x",
-            mServerUrl.get(), (unsigned)rv);
-    CloseWithLock();
+    Close();
     return rv;
   }
 
-  // Wait for response. OnMessageAvailable sets mRequestDone and notifies.
-  // OnStop/OnServerClose set mClosed on error.
-  mMonitor.Wait(TimeDuration::FromMilliseconds(mTimeoutMs));
-  fprintf(stderr, "[namecoin] SendRequest: wait done id=%d done=%s\n",
-          aReqId, mRequestDone ? "true" : "false");
-
-  if (!mRequestDone) {
-    if (mClosed) {
-      NMC_ERR("ElectrumX pool: connection lost for %s (id=%d)",
-              mServerUrl.get(), aReqId);
-      return NS_ERROR_NET_RESET;
-    }
-    NMC_ERR("ElectrumX pool: request timeout for %s (id=%d)",
-            mServerUrl.get(), aReqId);
-    CloseWithLock();
-    return NS_ERROR_NET_TIMEOUT;
-  }
-
-  if (NS_FAILED(mCurrentStatus)) {
-    return mCurrentStatus;
-  }
-
-  aResultJson = mCurrentResult;
-
-  // Reset idle timer — connection stays open for mIdleTTLMs more
-  ResetIdleTimer();
-  return NS_OK;
-}
-
-void nsElectrumXPooledConnection::ResetIdleTimer() {
-  // Called with mMonitor held. Dispatch timer setup to main thread
-  // to avoid cross-thread timer issues in Gecko.
-  if (mClosed) return;
-
-  // Cancel any existing timer
-  if (mIdleTimer) {
-    mIdleTimer->Cancel();
-    mIdleTimer = nullptr;
-  }
-
-  RefPtr<nsElectrumXPooledConnection> self = this;
-  uint32_t ttl = mIdleTTLMs;
-  NS_DispatchToMainThread(NS_NewRunnableFunction(
-      "ElectrumXPool::ResetIdleTimer",
-      [self, ttl]() {
-        MonitorAutoLock lock(self->mMonitor);
-        if (self->mClosed) return;
-        if (self->mIdleTimer) {
-          self->mIdleTimer->Cancel();
-          self->mIdleTimer = nullptr;
-        }
-        NS_NewTimerWithCallback(getter_AddRefs(self->mIdleTimer),
-                                self, ttl, nsITimer::TYPE_ONE_SHOT);
-        NMC_LOG("ElectrumX pool: idle timer set for %s (%ums)",
-                self->mServerUrl.get(), ttl);
-      }));
-}
-
-// nsIWebSocketListener -------------------------------------------------------
-
-NS_IMETHODIMP nsElectrumXPooledConnection::OnStart(nsISupports* aContext) {
-  MonitorAutoLock lock(mMonitor);
-  mConnected = true;
-  fprintf(stderr, "[namecoin] OnStart: WebSocket connected to %s\n", mServerUrl.get());
-  mMonitor.Notify();
-  return NS_OK;
-}
-
-NS_IMETHODIMP nsElectrumXPooledConnection::OnStop(nsISupports* aContext,
-                                                    nsresult aStatusCode) {
-  MonitorAutoLock lock(mMonitor);
-  NMC_LOG("ElectrumX pool: OnStop for %s: %08x",
-          mServerUrl.get(), (unsigned)aStatusCode);
-  fprintf(stderr, "[namecoin] OnStop: WebSocket closed for %s status=%08x\n",
-          mServerUrl.get(), (unsigned)aStatusCode);
-  if (!mRequestDone) {
-    mCurrentStatus = NS_FAILED(aStatusCode) ? aStatusCode : NS_ERROR_NET_RESET;
-    mRequestDone = true;
-  }
-  mClosed = true;
-  mConnected = false;
-  mMonitor.NotifyAll();
-  return NS_OK;
-}
-
-NS_IMETHODIMP nsElectrumXPooledConnection::OnMessageAvailable(
-    nsISupports* aContext, const nsACString& aMsg) {
-  MonitorAutoLock lock(mMonitor);
-
-  // Match response to current in-flight request by JSON-RPC id
+  // Read frames until we get one matching our request ID
   nsAutoCString idPattern;
   idPattern.AppendLiteral("\"id\":");
-  idPattern.AppendInt(mCurrentReqId);
+  idPattern.AppendInt(aReqId);
 
-  if (FindInReadable(idPattern, aMsg)) {
-    mCurrentResult = aMsg;
-    mCurrentStatus = NS_OK;
-    mRequestDone = true;
-    mMonitor.Notify();
+  PRIntervalTime deadline = PR_IntervalNow() +
+      PR_MillisecondsToInterval(mTimeoutMs);
+
+  while (true) {
+    if (PR_IntervalNow() > deadline) {
+      fprintf(stderr, "[namecoin] SendRequest: timeout waiting for id=%d\n", aReqId);
+      Close();
+      return NS_ERROR_NET_TIMEOUT;
+    }
+
+    nsCString frame;
+    rv = RecvFrame(frame);
+    if (NS_FAILED(rv)) {
+      Close();
+      return rv;
+    }
+
+    fprintf(stderr, "[namecoin] OnMessageAvailable: id=%d frame_len=%u\n",
+            aReqId, (unsigned)frame.Length());
+
+    if (FindInReadable(idPattern, frame)) {
+      aResultJson = frame;
+      return NS_OK;
+    }
+    // Non-matching frame (e.g. subscription push) — ignore, try again
   }
-  fprintf(stderr, "[namecoin] OnMessageAvailable: id=%d matched=%s msg_len=%u\n",
-          mCurrentReqId, mRequestDone ? "true" : "false", (unsigned)aMsg.Length());
-  // Non-matching messages (e.g. subscription pushes) are silently ignored.
-  return NS_OK;
-}
-
-NS_IMETHODIMP nsElectrumXPooledConnection::OnBinaryMessageAvailable(
-    nsISupports* aContext, const nsACString& aMsg) {
-  return NS_OK;  // Text protocol only
-}
-
-NS_IMETHODIMP nsElectrumXPooledConnection::OnAcknowledge(
-    nsISupports* aContext, uint32_t aSize) {
-  return NS_OK;
-}
-
-NS_IMETHODIMP nsElectrumXPooledConnection::OnServerClose(
-    nsISupports* aContext, uint16_t aCode, const nsACString& aReason) {
-  MonitorAutoLock lock(mMonitor);
-  NMC_LOG("ElectrumX pool: server close for %s (code=%u, reason=%s)",
-          mServerUrl.get(), aCode,
-          nsPromiseFlatCString(aReason).get());
-  if (!mRequestDone) {
-    mCurrentStatus = NS_ERROR_NET_RESET;
-    mRequestDone = true;
-  }
-  mClosed = true;
-  mConnected = false;
-  mMonitor.NotifyAll();
-  return NS_OK;
-}
-
-NS_IMETHODIMP nsElectrumXPooledConnection::OnError() {
-  MonitorAutoLock lock(mMonitor);
-  NMC_LOG("ElectrumX pool: OnError for %s", mServerUrl.get());
-  fprintf(stderr, "[namecoin] OnError: WebSocket error for %s\n", mServerUrl.get());
-  if (!mRequestDone) {
-    mCurrentStatus = NS_ERROR_FAILURE;
-    mRequestDone = true;
-  }
-  mClosed = true;
-  mConnected = false;
-  mMonitor.NotifyAll();
-  return NS_OK;
-}
-
-// nsITimerCallback -----------------------------------------------------------
-
-NS_IMETHODIMP nsElectrumXPooledConnection::Notify(nsITimer* aTimer) {
-  NMC_LOG("ElectrumX pool: idle timeout, closing connection to %s",
-          mServerUrl.get());
-  Close();
-  return NS_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -731,10 +728,9 @@ class nsElectrumXConnectionPool final {
 
   nsElectrumXConnectionPool(uint32_t aTimeoutMs, uint32_t aIdleTTLMs)
       : mMutex("nsElectrumXConnectionPool"),
-        mTimeoutMs(aTimeoutMs),
-        mIdleTTLMs(aIdleTTLMs) {
-    NMC_LOG("ElectrumX connection pool created (timeout=%ums, idle_ttl=%ums)",
-            aTimeoutMs, aIdleTTLMs);
+        mTimeoutMs(aTimeoutMs) {
+    (void)aIdleTTLMs;  // idle TTL not used with NSPR sockets (connection reuse handled per-request)
+    NMC_LOG("ElectrumX connection pool created (timeout=%ums)", aTimeoutMs);
   }
 
   /**
@@ -767,7 +763,6 @@ class nsElectrumXConnectionPool final {
   Mutex mMutex;
   bool mShutdown = false;
   uint32_t mTimeoutMs;
-  uint32_t mIdleTTLMs;
   nsTArray<PoolEntry> mEntries;
 };
 
@@ -789,8 +784,7 @@ nsElectrumXConnectionPool::GetConnection(const nsCString& aServer) {
   });
 
   // Create new connection
-  auto conn = MakeRefPtr<nsElectrumXPooledConnection>(
-      aServer, mTimeoutMs, mIdleTTLMs);
+  auto conn = MakeRefPtr<nsElectrumXPooledConnection>(aServer, mTimeoutMs);
 
   PoolEntry entry;
   entry.serverUrl = aServer;
@@ -857,16 +851,25 @@ void nsElectrumXConnectionPool::Shutdown() {
 nsresult nsNamecoinResolver::Init() {
   MutexAutoLock lock(mMutex);
 
-  mEnabled = Preferences::GetBool(kPrefEnabled, false);
+  // Use StaticPrefs for all pref reads — safe on any thread (RelaxedAtomicBool/Uint32).
+  // Preferences::GetBool/GetUint are NOT safe on socket/IO threads (crash in
+  // InitStaticMembers -> IsInServoTraversal). StaticPrefs mirrors are atomic.
+  mEnabled = StaticPrefs::network_namecoin_enabled();
   fprintf(stderr, "[namecoin] Init(): enabled=%s\n", mEnabled ? "true" : "false");
   if (!mEnabled) {
     NMC_LOG("Namecoin resolver disabled via pref");
     return NS_OK;
   }
 
-  // Server list
+  // Server list: network.namecoin.electrumx_servers is mirror:never (no StaticPrefs
+  // accessor). Read it via Preferences only if we're on the main thread; otherwise
+  // fall back to the compiled-in default. In practice Init() is called from a DNS
+  // Resolver thread, so we use the default. Users who need a custom server should
+  // set the pref before starting Firefox (or we can add a mirror:always variant).
   nsAutoCString serversPref;
-  Preferences::GetCString(kPrefServers, serversPref);
+  if (NS_IsMainThread()) {
+    Preferences::GetCString(kPrefServers, serversPref);
+  }
   if (serversPref.IsEmpty()) {
     serversPref.AssignLiteral(kDefaultServers);
   }
@@ -889,10 +892,10 @@ nsresult nsNamecoinResolver::Init() {
     return NS_ERROR_NOT_INITIALIZED;
   }
 
-  mCacheTTLSeconds  = Preferences::GetUint(kPrefCacheTTL, 3600);
-  mMaxAliasHops     = Preferences::GetUint(kPrefMaxAlias, 5);
-  mConnectionTimeoutMs = Preferences::GetUint(kPrefTimeout, 10000);
-  mQueryMultipleServers = Preferences::GetBool(kPrefQueryMultiple, false);
+  mCacheTTLSeconds  = StaticPrefs::network_namecoin_cache_ttl_seconds();
+  mMaxAliasHops     = StaticPrefs::network_namecoin_max_alias_hops();
+  mConnectionTimeoutMs = StaticPrefs::network_namecoin_connection_timeout_ms();
+  mQueryMultipleServers = StaticPrefs::network_namecoin_query_multiple_servers();
 
   // Create WebSocket connection pool.
   uint32_t idleTTLMs = mCacheTTLSeconds * 1000;

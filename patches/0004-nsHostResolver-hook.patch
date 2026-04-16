@@ -1,5 +1,5 @@
 diff --git a/netwerk/dns/nsHostResolver.cpp b/netwerk/dns/nsHostResolver.cpp
-index 301579cf9e..c238bc5a7a 100644
+index 301579cf9e..bc4da88670 100644
 --- a/netwerk/dns/nsHostResolver.cpp
 +++ b/netwerk/dns/nsHostResolver.cpp
 @@ -46,6 +46,7 @@
@@ -10,7 +10,7 @@ index 301579cf9e..c238bc5a7a 100644
  // Put DNSLogging.h at the end to avoid LOG being overwritten by other headers.
  #include "DNSLogging.h"
  
-@@ -1160,6 +1161,108 @@ nsresult nsHostResolver::NameLookup(nsHostRecord* rec,
+@@ -1160,6 +1161,117 @@ nsresult nsHostResolver::NameLookup(nsHostRecord* rec,
    // so we don't wrongly report the reason for the previous one.
    rec->Reset();
  
@@ -19,99 +19,108 @@ index 301579cf9e..c238bc5a7a 100644
 +  // The singleton is initialized under mLock (which we already hold here),
 +  // then the lock is dropped before ResolveSync to avoid deadlock with
 +  // the socket thread (which does DNS lookups for the ElectrumX hostname).
++  //
++  // MAIN THREAD GUARD: ResolveSync does blocking WebSocket I/O and must
++  // never run on the main thread. NameLookup can be called from the main
++  // thread via nsDNSPrefetch / TestHTTPAnswerRunnable. Skip Namecoin in
++  // that path — the DNS resolver thread pool will handle it separately.
 +  {
 +    const nsCString& host = rec->host;
 +    if (nsNamecoinResolver::IsNamecoinHost(host)) {
-+      bool enabled = Preferences::GetBool("network.namecoin.enabled", false);
-+      if (enabled) {
++      fprintf(stderr, "[namecoin] NameLookup: .bit seen: %s isMain=%d enabled=%d\n",
++              host.get(), (int)NS_IsMainThread(),
++              (int)StaticPrefs::network_namecoin_enabled());
++    }
++    if (!NS_IsMainThread() && nsNamecoinResolver::IsNamecoinHost(host) &&
++        StaticPrefs::network_namecoin_enabled()) {
++      // StaticPrefs::network_namecoin_enabled() is a RelaxedAtomicBool —
++      // safe to read from any thread with no initialization required.
++      // This replaces the old Preferences::GetBool() call which crashed on
++      // socket/IO threads via InitStaticMembers() -> IsInServoTraversal().
++      //
++      // Singleton init is guarded by mLock (already held by caller).
++      static nsNamecoinResolver* sNmcResolver = nullptr;
++
++      fprintf(stderr, "[namecoin] NameLookup: entering hook, sNmcResolver=%p\n", sNmcResolver);
++      if (!sNmcResolver) {
++        RefPtr<nsNamecoinResolver> resolver = new nsNamecoinResolver();
++        nsresult initRv = resolver->Init();
++        if (NS_FAILED(initRv)) {
++          LOG(("NameLookup [namecoin]: resolver Init() failed: %08x",
++               (unsigned)initRv));
++          fprintf(stderr, "[namecoin] NameLookup: resolver Init() FAILED: %08x\n",
++                  (unsigned)initRv);
++          // Leave sNmcResolver null — will retry on next .bit lookup.
++        } else {
++          sNmcResolver = resolver.forget().take();
++          LOG(("NameLookup [namecoin]: resolver initialized OK"));
++          fprintf(stderr, "[namecoin] NameLookup: resolver initialized OK\n");
++        }
++      }
++
++      if (sNmcResolver) {
 +        LOG(("NameLookup [namecoin]: .bit domain detected: %s (enabled=true)",
 +             host.get()));
 +        fprintf(stderr, "[namecoin] NameLookup: .bit detected: %s\n", host.get());
 +
-+        // Singleton init under mLock (we already hold it here).
-+        // RefPtr is used for construction; on success we forget() ownership
-+        // into the raw sNmcResolver pointer (process-lifetime singleton).
-+        static nsNamecoinResolver* sNmcResolver = nullptr;
-+        if (!sNmcResolver) {
-+          RefPtr<nsNamecoinResolver> resolver = new nsNamecoinResolver();
-+          nsresult initRv = resolver->Init();
-+          if (NS_FAILED(initRv)) {
-+            LOG(("NameLookup [namecoin]: resolver Init() failed: %08x",
-+                 (unsigned)initRv));
-+            fprintf(stderr, "[namecoin] NameLookup: resolver Init() FAILED: %08x\n",
-+                    (unsigned)initRv);
-+            // resolver RefPtr goes out of scope, releasing the object.
-+          } else {
-+            sNmcResolver = resolver.forget().take();
-+            LOG(("NameLookup [namecoin]: resolver initialized OK"));
-+            fprintf(stderr, "[namecoin] NameLookup: resolver initialized OK\n");
-+          }
++        // Copy host before releasing lock (rec->host may be invalidated).
++        nsAutoCString hostCopy(host);
++        NamecoinResolveResult nmcResult;
++        nsresult nmcRv;
++
++        // Release mLock for blocking WebSocket I/O.
++        // MutexAutoUnlock re-acquires mLock on destruction (end of block).
++        {
++          mozilla::MutexAutoUnlock unlock(mLock);
++          LOG(("NameLookup [namecoin]: releasing DNS lock, resolving %s via ElectrumX",
++               hostCopy.get()));
++          fprintf(stderr, "[namecoin] NameLookup: releasing DNS lock, calling ResolveSync(%s)\n",
++                  hostCopy.get());
++          nmcRv = sNmcResolver->ResolveSync(hostCopy, nmcResult);
 +        }
++        // mLock re-acquired here.
 +
-+        if (sNmcResolver) {
-+          // Copy host before releasing lock (rec->host may be invalidated).
-+          nsAutoCString hostCopy(host);
-+
-+          NamecoinResolveResult nmcResult;
-+          nsresult nmcRv;
-+
-+          // Release mLock for blocking WebSocket I/O.
-+          // MutexAutoUnlock re-acquires mLock on destruction (end of block).
-+          {
-+            mozilla::MutexAutoUnlock unlock(mLock);
-+            LOG(("NameLookup [namecoin]: releasing DNS lock, resolving %s via ElectrumX",
-+                 hostCopy.get()));
-+            fprintf(stderr, "[namecoin] NameLookup: releasing DNS lock, calling ResolveSync(%s)\n",
-+                    hostCopy.get());
-+            nmcRv = sNmcResolver->ResolveSync(hostCopy, nmcResult);
-+          }
-+          // mLock re-acquired here.
-+
-+          if (NS_SUCCEEDED(nmcRv) && nmcResult.resolved &&
-+              !nmcResult.addresses.IsEmpty()) {
-+            LOG(("NameLookup [namecoin]: resolved %s -> ip=%s ip6=%s "
-+                 "tx=%s height=%u ttl=%us addrs=%zu",
-+                 hostCopy.get(),
-+                 nmcResult.nameValue.ip.get(),
-+                 nmcResult.nameValue.ip6.get(),
-+                 nmcResult.txHash.get(),
-+                 nmcResult.updateHeight,
-+                 nmcResult.ttlSeconds,
-+                 nmcResult.addresses.Length()));
-+            fprintf(stderr,
-+                    "[namecoin] NameLookup: RESOLVED %s -> ip=%s ip6=%s "
-+                    "tx=%s height=%u ttl=%us addrs=%zu\n",
-+                    hostCopy.get(),
-+                    nmcResult.nameValue.ip.get(),
-+                    nmcResult.nameValue.ip6.get(),
-+                    nmcResult.txHash.get(),
-+                    nmcResult.updateHeight,
-+                    nmcResult.ttlSeconds,
-+                    nmcResult.addresses.Length());
-+            // Phase 1: log success, fall through to normal DNS (graceful degradation).
-+            // Phase 2 TODO: populate rec with nmcResult.addresses and return NS_OK.
-+          } else {
-+            LOG(("NameLookup [namecoin]: resolve failed for %s: rv=%08x resolved=%s "
-+                 "addrs=%zu error=%s",
-+                 hostCopy.get(),
-+                 (unsigned)nmcRv,
-+                 nmcResult.resolved ? "true" : "false",
-+                 nmcResult.addresses.Length(),
-+                 nmcResult.error.get()));
-+            fprintf(stderr,
-+                    "[namecoin] NameLookup: FAILED %s rv=%08x resolved=%s "
-+                    "addrs=%zu error=%s\n",
-+                    hostCopy.get(),
-+                    (unsigned)nmcRv,
-+                    nmcResult.resolved ? "true" : "false",
-+                    nmcResult.addresses.Length(),
-+                    nmcResult.error.get());
-+          }
++        if (NS_SUCCEEDED(nmcRv) && nmcResult.resolved &&
++            !nmcResult.addresses.IsEmpty()) {
++          LOG(("NameLookup [namecoin]: resolved %s -> ip=%s ip6=%s "
++               "tx=%s height=%u ttl=%us addrs=%zu",
++               hostCopy.get(),
++               nmcResult.nameValue.ip.get(),
++               nmcResult.nameValue.ip6.get(),
++               nmcResult.txHash.get(),
++               nmcResult.updateHeight,
++               nmcResult.ttlSeconds,
++               nmcResult.addresses.Length()));
++          fprintf(stderr,
++                  "[namecoin] NameLookup: RESOLVED %s -> ip=%s ip6=%s "
++                  "tx=%s height=%u ttl=%us addrs=%zu\n",
++                  hostCopy.get(),
++                  nmcResult.nameValue.ip.get(),
++                  nmcResult.nameValue.ip6.get(),
++                  nmcResult.txHash.get(),
++                  nmcResult.updateHeight,
++                  nmcResult.ttlSeconds,
++                  nmcResult.addresses.Length());
++          // Phase 1: log success, fall through to normal DNS (graceful degradation).
++          // Phase 2 TODO: populate rec with nmcResult.addresses and return NS_OK.
++        } else {
++          LOG(("NameLookup [namecoin]: resolve failed for %s: rv=%08x resolved=%s "
++               "addrs=%zu error=%s",
++               hostCopy.get(),
++               (unsigned)nmcRv,
++               nmcResult.resolved ? "true" : "false",
++               nmcResult.addresses.Length(),
++               nmcResult.error.get()));
++          fprintf(stderr,
++                  "[namecoin] NameLookup: FAILED %s rv=%08x resolved=%s "
++                  "addrs=%zu error=%s\n",
++                  hostCopy.get(),
++                  (unsigned)nmcRv,
++                  nmcResult.resolved ? "true" : "false",
++                  nmcResult.addresses.Length(),
++                  nmcResult.error.get());
 +        }
 +        // Fall through to normal DNS (graceful degradation — Phase 1 behaviour).
-+      } else {
-+        LOG(("NameLookup [namecoin]: .bit domain %s but pref network.namecoin.enabled=false",
-+             host.get()));
 +      }
 +    }
 +  }

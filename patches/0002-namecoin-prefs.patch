@@ -1,103 +1,52 @@
-From: Namecoin Integration <namecoin-integration@example.com>
-Date: 2026-04-16
-Subject: [PATCH 2/4] netwerk: Add network.namecoin.* preferences
-
-Registers the about:config preferences used by nsNamecoinResolver:
-  - network.namecoin.enabled                (boolean, default false)
-  - network.namecoin.electrumx_servers      (string, default ws://electrumx.testls.space:50003)
-  - network.namecoin.cache_ttl_seconds      (uint32, default 3600)
-  - network.namecoin.require_tls            (boolean, default true)
-  - network.namecoin.max_alias_hops         (uint32, default 5)
-  - network.namecoin.connection_timeout_ms  (uint32, default 10000)
-  - network.namecoin.query_multiple_servers (boolean, default true)
-
-All prefs are off/disabled by default. The resolver is only active when
-network.namecoin.enabled is set to true via about:config.
-
-Phase 2 will add settings UI; for Phase 1 these are about:config only.
-
-Bug: <to be filed on bugzilla.mozilla.org>
-Reviewed-by: <pending>
-
----
- modules/libpref/init/StaticPrefList.yaml | 60 ++++++++++++++++++++++++++++++
- 1 file changed, 60 insertions(+)
-
 diff --git a/modules/libpref/init/StaticPrefList.yaml b/modules/libpref/init/StaticPrefList.yaml
-index 00000001..00000002 100644
+index cb4bef4933..6b733c75a2 100644
 --- a/modules/libpref/init/StaticPrefList.yaml
 +++ b/modules/libpref/init/StaticPrefList.yaml
-@@ -8500,6 +8500,66 @@
-   value: true
+@@ -15226,6 +15226,47 @@
+   value: false
    mirror: always
  
-+# ---------------------------------------------------------------------------
-+# network.namecoin.* — Namecoin (.bit) decentralized domain resolution
-+#
-+# Allows Firefox to resolve .bit domains via the Namecoin blockchain using
-+# the ElectrumX JSON-RPC-over-WebSocket protocol. Disabled by default.
-+#
-+# Phase 1: DNS resolution only (A/AAAA records).
-+# Phase 2 will add DANE-TLSA certificate validation.
-+#
-+# See: nsNamecoinResolver.{h,cpp} in netwerk/dns/
-+# ---------------------------------------------------------------------------
++# -----------------------------------------------------------------------
++# Namecoin (.bit) native DNS resolution
++# -----------------------------------------------------------------------
 +
++# Master switch for Namecoin .bit domain resolution via ElectrumX
 +- name: network.namecoin.enabled
-+  type: bool
++  type: RelaxedAtomicBool
 +  value: false
 +  mirror: always
-+  doc: >
-+    Enable Namecoin (.bit) decentralized domain resolution via ElectrumX.
-+    When true, .bit hostnames are resolved against the Namecoin blockchain
-+    instead of system DNS. Disabled by default.
 +
++# Comma-separated list of ElectrumX servers (wss:// URLs)
 +- name: network.namecoin.electrumx_servers
-+  type: DataMutexString
-+  value: "ws://electrumx.testls.space:50003"
++  type: String
++  # Use IP to avoid DNS deadlock (see nsNamecoinResolver.cpp kDefaultServers)
++  value: "ws://162.212.154.52:50003"
 +  mirror: never
-+  doc: >
-+    Comma-separated list of ElectrumX server URLs (ws:// or wss://) for
-+    Namecoin name resolution. Multiple servers provide redundancy and
-+    cross-validation. Users should add their own trusted server.
 +
++# TTL for resolved Namecoin addresses in seconds
 +- name: network.namecoin.cache_ttl_seconds
-+  type: uint32_t
++  type: RelaxedAtomicUint32
 +  value: 3600
 +  mirror: always
-+  doc: >
-+    Cache TTL for resolved Namecoin names (seconds). Actual TTL may be
-+    lower based on how many blocks remain before name expiry.
 +
-+- name: network.namecoin.require_tls
-+  type: bool
-+  value: true
-+  mirror: always
-+  doc: >
-+    When true, refuse to load .bit pages over plain HTTP if TLSA records
-+    exist in the name value. Only relevant after Phase 2 (TLS integration).
-+
++# Maximum number of alias hops to follow
 +- name: network.namecoin.max_alias_hops
-+  type: uint32_t
++  type: RelaxedAtomicUint32
 +  value: 5
 +  mirror: always
-+  doc: >
-+    Maximum number of alias chain hops to follow when a Namecoin name has
-+    an "alias" field pointing to another .bit domain.
 +
++# Connection timeout for ElectrumX WebSocket in milliseconds
 +- name: network.namecoin.connection_timeout_ms
-+  type: uint32_t
++  type: RelaxedAtomicUint32
 +  value: 10000
 +  mirror: always
-+  doc: >
-+    Timeout (milliseconds) for ElectrumX WebSocket connections.
 +
++# Query multiple servers simultaneously for redundancy
 +- name: network.namecoin.query_multiple_servers
-+  type: bool
-+  value: true
++  type: RelaxedAtomicBool
++  value: false
 +  mirror: always
-+  doc: >
-+    When true, query multiple ElectrumX servers and cross-validate results
-+    for increased security against malicious servers.
 +
- # ---------------------------------------------------------------------------
+ # Whether to prefer IPv6 name lookups.
+ - name: network.dns.preferIPv6
+   type: RelaxedAtomicBool
