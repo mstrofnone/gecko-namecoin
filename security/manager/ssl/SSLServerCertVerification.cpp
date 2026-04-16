@@ -895,8 +895,23 @@ SSLServerCertVerificationJob::Run() {
               .AccumulateRawDuration(elapsed);
           glean::ssl::cert_error_overrides.AccumulateSingleSample(1);
 
+          // AuthCertificate failed, so builtChainBytesArray is empty.
+          // Dispatch() asserts that the built chain is non-empty on success.
+          // Populate it from the peer cert chain (what the server sent us)
+          // since that's the chain DANE validated.
+          builtChainBytesArray.Clear();
+          for (const auto& certDER : mPeerCertChain) {
+            builtChainBytesArray.AppendElement(certDER.Clone());
+          }
+
+          // Make a copy of peer chain too — both args are moved.
+          nsTArray<nsTArray<uint8_t>> peerChainCopy;
+          for (const auto& certDER : mPeerCertChain) {
+            peerChainCopy.AppendElement(certDER.Clone());
+          }
+
           nsresult dispRv = mResultTask->Dispatch(
-              std::move(builtChainBytesArray), std::move(mPeerCertChain),
+              std::move(builtChainBytesArray), std::move(peerChainCopy),
               TransportSecurityInfo::ConvertCertificateTransparencyInfoToStatus(
                   certificateTransparencyInfo),
               EVStatus::NotEV, true, 0,
